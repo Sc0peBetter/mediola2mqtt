@@ -10,6 +10,7 @@ import yaml
 import os
 import sys
 import requests
+import threading
 
 if os.path.exists('/data/options.json'):
     print('Running in hass.io add-on mode')
@@ -29,6 +30,106 @@ elif os.path.exists('mediola2mqtt.yaml'):
 else:
     print('Configuration file not found, exiting.')
     sys.exit(1)
+
+# Track blind positions (identifier -> 0-100) and active movement timers
+blind_positions = {}
+blind_timers = {}
+
+def send_blind_command(blind_cfg, adr, command, mediolaid):
+    """Send open/close/stop command for a blind via HTTP. Returns True on success."""
+    dtype = blind_cfg['type']
+    if dtype == 'IR':
+        key = command + '_value'
+        if key not in blind_cfg:
+            print(f"Missing {key} for IR blind: {adr}")
+            return False
+        payload = {"XC_FNC": "Send2", "type": "CODE", "ir": "01", "code": blind_cfg[key]}
+    elif dtype == 'RT':
+        prefix = {'open': '20', 'close': '40', 'stop': '10'}[command]
+        payload = {"XC_FNC": "SendSC", "type": "RT", "data": prefix + adr}
+    elif dtype == 'ER':
+        suffix = {'open': '01', 'close': '00', 'stop': '02'}[command]
+        payload = {"XC_FNC": "SendSC", "type": "ER", "data": format(int(adr), "02x") + suffix}
+    else:
+        return False
+
+    host = ''
+    if isinstance(config['mediola'], list):
+        for jj in range(len(config['mediola'])):
+            if mediolaid == config['mediola'][jj]['id']:
+                host = config['mediola'][jj]['host']
+            if 'password' in config['mediola'][jj] and config['mediola'][jj]['password'] != '':
+                payload['XC_PASS'] = config['mediola'][jj]['password']
+    else:
+        host = config['mediola']['host']
+        if 'password' in config['mediola'] and config['mediola']['password'] != '':
+            payload['XC_PASS'] = config['mediola']['password']
+    if host == '':
+        print('Error: Could not find matching Mediola!')
+        return False
+    url = 'http://' + host + '/command'
+    response = requests.get(url, params=payload, headers={'Connection': 'close'})
+    if config['mqtt']['debug']:
+        print(f"Send Mediola: {payload} --> {response.text}")
+    return True
+
+def handle_blind_position(dtype, adr, mediolaid, spayload):
+    """Handle a set_position command (0-100) using travel_time-based timing."""
+    try:
+        target = int(float(spayload))
+        target = max(0, min(100, target))
+    except (ValueError, TypeError):
+        print(f"Invalid position value: {spayload}")
+        return
+
+    for ii in range(len(config['blinds'])):
+        if config['blinds'][ii]['type'] != dtype:
+            continue
+        if 'adr' in config['blinds'][ii]:
+            cadr = config['blinds'][ii]['adr']
+        elif dtype == 'IR' and 'name' in config['blinds'][ii]:
+            cadr = get_IR_address(config['blinds'][ii]['name'])
+        else:
+            continue
+        if adr != cadr:
+            continue
+        if isinstance(config['mediola'], list):
+            if config['blinds'][ii].get('mediola') != mediolaid:
+                continue
+
+        travel_time = config['blinds'][ii].get('travel_time', 0)
+        if not travel_time:
+            print(f"No travel_time configured for blind: {adr}")
+            return
+
+        mid = config['blinds'][ii]['mediola'] if isinstance(config['mediola'], list) else 'mediola'
+        identifier = dtype + '_' + cadr
+        pos_topic = config['mqtt']['topic'] + '/blinds/' + mid + '/' + identifier + '/position'
+        current = blind_positions.get(identifier, 100)
+
+        if target == current:
+            return
+
+        # Cancel any active movement timer
+        if identifier in blind_timers:
+            blind_timers[identifier].cancel()
+            blind_timers.pop(identifier, None)
+
+        direction = 'open' if target > current else 'close'
+        duration = travel_time * abs(target - current) / 100.0
+        send_blind_command(config['blinds'][ii], cadr, direction, mid)
+
+        def finish_position(ident=identifier, bcfg=config['blinds'][ii], c=cadr,
+                            fp=target, m=mid, pt=pos_topic):
+            send_blind_command(bcfg, c, 'stop', m)
+            blind_positions[ident] = fp
+            mqttc.publish(pt, payload=str(fp), retain=True)
+            blind_timers.pop(ident, None)
+
+        t = threading.Timer(duration, finish_position)
+        blind_timers[identifier] = t
+        t.start()
+        return
 
 # Define MQTT event callbacks
 def on_connect(client, userdata, flags, rc):
@@ -59,6 +160,22 @@ def on_message(client, obj, msg):
     mediolaid = dtype.split("/")[-2]
     dtype = dtype[dtype.rfind("/")+1:]
     adr = adr[:adr.find("/")]
+
+    # Determine basic direction for position tracking
+    if msg.payload in (b'open', b'up', b'on'):
+        blind_command = 'open'
+    elif msg.payload in (b'close', b'down', b'off'):
+        blind_command = 'close'
+    elif msg.payload == b'stop':
+        blind_command = 'stop'
+    else:
+        blind_command = None
+
+    # Route position commands to dedicated handler
+    if '/position/set' in msg.topic:
+        handle_blind_position(dtype, adr, mediolaid, spayload)
+        return
+
     for ii in range(0, len(config['blinds'])):
         # get address of configured blind
         if 'adr' in config['blinds'][ii]:
@@ -248,6 +365,27 @@ def on_message(client, obj, msg):
             response = requests.get(url, params=payload, headers={'Connection':'close'})
             if config['mqtt']['debug']:
                 print(f"Send Mediola: {payload} --> {response.text}")
+
+            # Update position tracking for blinds with travel_time configured
+            travel_time = config['blinds'][ii].get('travel_time', 0)
+            if travel_time and blind_command in ('open', 'close', 'stop'):
+                mid = mediolaid
+                identifier_key = dtype + '_' + cadr
+                pos_topic = config['mqtt']['topic'] + '/blinds/' + mid + '/' + identifier_key + '/position'
+                if identifier_key in blind_timers:
+                    blind_timers[identifier_key].cancel()
+                    blind_timers.pop(identifier_key, None)
+                if blind_command == 'stop':
+                    mqttc.publish(pos_topic, payload=str(blind_positions.get(identifier_key, 100)), retain=True)
+                else:
+                    final_pos = 100 if blind_command == 'open' else 0
+                    def _finish_full(ident=identifier_key, fp=final_pos, pt=pos_topic):
+                        blind_positions[ident] = fp
+                        mqttc.publish(pt, payload=str(fp), retain=True)
+                        blind_timers.pop(ident, None)
+                    t = threading.Timer(travel_time, _finish_full)
+                    blind_timers[identifier_key] = t
+                    t.start()
 
     for ii in range(0, len(config['switches'])):
         #currently only Intertechno and IR (= "other")
@@ -478,6 +616,10 @@ def setup_discovery():
             # only add stop payload if supported (IR blinds may not have stop_value)
             if btype != 'IR' or 'stop_value' in config['blinds'][ii]:
                 payload["payload_stop"] = "stop"
+            # add position control if travel_time is configured
+            if 'travel_time' in config['blinds'][ii]:
+                payload['set_position_topic'] = topic + '/position/set'
+                payload['position_topic'] = topic + '/position'
             # apply template if defined and override values
             if 'template' in config['blinds'][ii]:
                 template = config['blinds'][ii]['template']
@@ -504,6 +646,8 @@ def setup_discovery():
                 payload["state_topic"] = topic + "/state"
             payload = json.dumps(payload)
             mqttc.subscribe(topic + "/set")
+            if 'travel_time' in config['blinds'][ii]:
+                mqttc.subscribe(topic + '/position/set')
             mqttc.publish(dtopic, payload=payload, retain=True)
 
 def handle_button(packet_type, address, state, mediolaid):
