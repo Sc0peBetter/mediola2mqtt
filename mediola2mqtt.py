@@ -37,6 +37,11 @@ blind_positions = {}
 blind_timers = {}
 # Track active movements: identifier -> {'start_time', 'start_pos', 'target_pos', 'travel_time'}
 blind_movements = {}
+# Periodic position update timers for smoother percentage feedback in Home Assistant
+blind_progress_timers = {}
+
+def get_blind_identifier(mediolaid, dtype, adr):
+    return mediolaid + '_' + dtype + '_' + adr
 
 def get_current_blind_position(identifier):
     """Calculate the current position based on elapsed movement time."""
@@ -52,6 +57,25 @@ def get_current_blind_position(identifier):
         else:
             return round(mov['start_pos'] - progress * (mov['start_pos'] - mov['target_pos']))
     return blind_positions.get(identifier, 100)
+
+def start_blind_progress_updates(identifier, pos_topic):
+    """Publish estimated blind position periodically while a timed movement is active."""
+    if identifier in blind_progress_timers:
+        blind_progress_timers[identifier].cancel()
+        blind_progress_timers.pop(identifier, None)
+
+    def _publish_progress(ident=identifier, topic=pos_topic):
+        if ident not in blind_movements:
+            blind_progress_timers.pop(ident, None)
+            return
+        mqttc.publish(topic, payload=str(get_current_blind_position(ident)), retain=True)
+        t = threading.Timer(1.0, _publish_progress, kwargs={'ident': ident, 'topic': topic})
+        blind_progress_timers[ident] = t
+        t.start()
+
+    t = threading.Timer(1.0, _publish_progress)
+    blind_progress_timers[identifier] = t
+    t.start()
 
 def send_blind_command(blind_cfg, adr, command, mediolaid):
     """Send open/close/stop command for a blind via HTTP. Returns True on success."""
@@ -76,8 +100,9 @@ def send_blind_command(blind_cfg, adr, command, mediolaid):
         for jj in range(len(config['mediola'])):
             if mediolaid == config['mediola'][jj]['id']:
                 host = config['mediola'][jj]['host']
-            if 'password' in config['mediola'][jj] and config['mediola'][jj]['password'] != '':
-                payload['XC_PASS'] = config['mediola'][jj]['password']
+                if 'password' in config['mediola'][jj] and config['mediola'][jj]['password'] != '':
+                    payload['XC_PASS'] = config['mediola'][jj]['password']
+                break
     else:
         host = config['mediola']['host']
         if 'password' in config['mediola'] and config['mediola']['password'] != '':
@@ -121,8 +146,9 @@ def handle_blind_position(dtype, adr, mediolaid, spayload):
             return
 
         mid = config['blinds'][ii]['mediola'] if isinstance(config['mediola'], list) else 'mediola'
-        identifier = dtype + '_' + cadr
-        pos_topic = config['mqtt']['topic'] + '/blinds/' + mid + '/' + identifier + '/position'
+        identifier = get_blind_identifier(mid, dtype, cadr)
+        topic_identifier = dtype + '_' + cadr
+        pos_topic = config['mqtt']['topic'] + '/blinds/' + mid + '/' + topic_identifier + '/position'
         current = get_current_blind_position(identifier)
 
         if target == current:
@@ -146,12 +172,16 @@ def handle_blind_position(dtype, adr, mediolaid, spayload):
             'target_pos': target,
             'travel_time': travel_time,
         }
+        start_blind_progress_updates(identifier, pos_topic)
 
         def finish_position(ident=identifier, bcfg=config['blinds'][ii], c=cadr,
                             fp=target, m=mid, pt=pos_topic):
             send_blind_command(bcfg, c, 'stop', m)
             blind_positions[ident] = fp
             blind_movements.pop(ident, None)
+            if ident in blind_progress_timers:
+                blind_progress_timers[ident].cancel()
+                blind_progress_timers.pop(ident, None)
             mqttc.publish(pt, payload=str(fp), retain=True)
             blind_timers.pop(ident, None)
 
@@ -381,8 +411,9 @@ def on_message(client, obj, msg):
                 for jj in range(0, len(config['mediola'])):
                     if mediolaid == config['mediola'][jj]['id']:
                         host = config['mediola'][jj]['host']
-                    if 'password' in config['mediola'][jj] and config['mediola'][jj]['password'] != '':
-                        payload['XC_PASS'] = config['mediola'][jj]['password']
+                        if 'password' in config['mediola'][jj] and config['mediola'][jj]['password'] != '':
+                            payload['XC_PASS'] = config['mediola'][jj]['password']
+                        break
             else:
                 host = config['mediola']['host']
                 if 'password' in config['mediola'] and config['mediola']['password'] != '':
@@ -399,8 +430,9 @@ def on_message(client, obj, msg):
             travel_time = config['blinds'][ii].get('travel_time', 0)
             if travel_time and blind_command in ('open', 'close', 'stop'):
                 mid = mediolaid
-                identifier_key = dtype + '_' + cadr
-                pos_topic = config['mqtt']['topic'] + '/blinds/' + mid + '/' + identifier_key + '/position'
+                identifier_key = get_blind_identifier(mid, dtype, cadr)
+                topic_identifier = dtype + '_' + cadr
+                pos_topic = config['mqtt']['topic'] + '/blinds/' + mid + '/' + topic_identifier + '/position'
                 current = get_current_blind_position(identifier_key)
                 if identifier_key in blind_timers:
                     blind_timers[identifier_key].cancel()
@@ -408,6 +440,9 @@ def on_message(client, obj, msg):
                 blind_positions[identifier_key] = current
                 blind_movements.pop(identifier_key, None)
                 if blind_command == 'stop':
+                    if identifier_key in blind_progress_timers:
+                        blind_progress_timers[identifier_key].cancel()
+                        blind_progress_timers.pop(identifier_key, None)
                     mqttc.publish(pos_topic, payload=str(current), retain=True)
                 else:
                     final_pos = 100 if blind_command == 'open' else 0
@@ -418,9 +453,13 @@ def on_message(client, obj, msg):
                         'target_pos': final_pos,
                         'travel_time': travel_time,
                     }
+                    start_blind_progress_updates(identifier_key, pos_topic)
                     def _finish_full(ident=identifier_key, fp=final_pos, pt=pos_topic):
                         blind_positions[ident] = fp
                         blind_movements.pop(ident, None)
+                        if ident in blind_progress_timers:
+                            blind_progress_timers[ident].cancel()
+                            blind_progress_timers.pop(ident, None)
                         mqttc.publish(pt, payload=str(fp), retain=True)
                         blind_timers.pop(ident, None)
                     t = threading.Timer(duration, _finish_full)
@@ -490,8 +529,9 @@ def on_message(client, obj, msg):
                 for jj in range(0, len(config['mediola'])):
                     if mediolaid == config['mediola'][jj]['id']:
                         host = config['mediola'][jj]['host']
-                    if 'password' in config['mediola'][jj] and config['mediola'][jj]['password'] != '':
-                        payload['XC_PASS'] = config['mediola'][jj]['password']
+                        if 'password' in config['mediola'][jj] and config['mediola'][jj]['password'] != '':
+                            payload['XC_PASS'] = config['mediola'][jj]['password']
+                        break
             else:
                 host = config['mediola']['host']
                 if 'password' in config['mediola'] and config['mediola']['password'] != '':
@@ -571,7 +611,7 @@ def setup_discovery():
             host = ''
             mediolaid = 'mediola'
             if isinstance(config['mediola'], list):
-                mediolaid = config['buttons'][ii]['mediola']
+                mediolaid = config['switches'][ii]['mediola']
                 for jj in range(0, len(config['mediola'])):
                     if mediolaid == config['mediola'][jj]['id']:
                         host = config['mediola'][jj]['host']
@@ -665,9 +705,11 @@ def setup_discovery():
                 template = config['blinds'][ii]['template']
                 if 'templates' in config:
                     try:
+                        template_found = False
                         for tpl in config['templates']:
                             if tpl['tpl_name'] != template:
                                 continue
+                            template_found = True
                             tpl_pl = dict(tpl)
                             del tpl_pl["tpl_name"]  # not part of the payload
                             for tpl_index, (tpl_key, tpl_value) in enumerate(tpl_pl.items()):
@@ -676,7 +718,8 @@ def setup_discovery():
                             if 'tilt_command_topic' not in payload and ('tilt_opened_value' in payload or 'tilt_closed_value' in payload):
                                 payload['tilt_command_topic'] = payload['command_topic']
                             break
-                        print(f"Missing template: {template}")
+                        if not template_found:
+                            print(f"Missing template: {template}")
                     except BaseException as err:
                         print(f"Unexpected {err=}, {type(err)=}")
                         raise
