@@ -47,10 +47,13 @@
       },
       "blinds": [
         {
-        "type": "match(ER|RT)?",
+        "type": "match(ER|RT|IR)?",
         "adr": "str?",
         "name": "str?",
-        "template": "str?"
+        "template": "str?",
+        "open_value": "str?",
+        "close_value": "str?",
+        "stop_value": "str?"
         }
       ],
       "switches": [

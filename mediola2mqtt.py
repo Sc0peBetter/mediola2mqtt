@@ -60,133 +60,175 @@ def on_message(client, obj, msg):
     dtype = dtype[dtype.rfind("/")+1:]
     adr = adr[:adr.find("/")]
     for ii in range(0, len(config['blinds'])):
-        if dtype == config['blinds'][ii]['type'] and adr == config['blinds'][ii]['adr']:
+        # get address of configured blind
+        if 'adr' in config['blinds'][ii]:
+            cadr = config['blinds'][ii]['adr']
+        elif dtype == 'IR' and 'name' in config['blinds'][ii]:
+            cadr = get_IR_address(config['blinds'][ii]['name'])
+        else:
+            continue
+
+        if dtype == config['blinds'][ii]['type'] and adr == cadr:
             if isinstance(config['mediola'], list):
                 if config['blinds'][ii]['mediola'] != mediolaid:
                     continue
-            if msg.payload == b'open':
-                if dtype == 'RT':
-                    data = "20" + adr
-                elif dtype == 'ER':
-                    data = format(int(adr), "02x") + "01"
-                else:
-                    return
-            elif msg.payload == b'close':
-                if dtype == 'RT':
-                    data = "40" + adr
-                elif dtype == 'ER':
-                    data = format(int(adr), "02x") + "00"
-                else:
-                    return
-            elif msg.payload == b'stop':
-                if dtype == 'RT':
-                    data = "10" + adr
-                elif dtype == 'ER':
-                    data = format(int(adr), "02x") + "02"
-                else:
-                    return
-            # extended commands
-            elif msg.payload == b'down' or msg.payload == b'off':
-                if dtype == 'RT':
-                    data = "40" + adr
-                elif dtype == 'ER':
-                    data = format(int(adr), "02x") + "00"
-                else:
-                    return
-            elif msg.payload == b'up' or msg.payload == b'on':
-                if dtype == 'RT':
-                    data = "20" + adr
-                elif dtype == 'ER':
-                    data = format(int(adr), "02x") + "01"
-                else:
-                    return
-            elif msg.payload == b'upstep':
-                if dtype == 'ER':
-                    data = format(int(adr), "02x") + "03"
-                else:
-                    return
-            elif msg.payload == b'downstep':
-                if dtype == 'ER':
-                    data = format(int(adr), "02x") + "04"
-                else:
-                    return
-            elif msg.payload == b'manumode':
-                if dtype == 'ER':
-                    data = format(int(adr), "02x") + "05"
-                else:
-                    return
-            elif msg.payload == b'automode':
-                if dtype == 'ER':
-                    data = format(int(adr), "02x") + "06"
-                else:
-                    return
-            elif msg.payload == b'togglemode':
-                if dtype == 'ER':
-                    data = format(int(adr), "02x") + "07"
-                else:
-                    return
-            elif msg.payload == b'longup':
-                if dtype == 'ER':
-                    data = format(int(adr), "02x") + "08"
-                else:
-                    return
-            elif msg.payload == b'longdown':
-                if dtype == 'ER':
-                    data = format(int(adr), "02x") + "09"
-                else:
-                    return
-            elif msg.payload == b'doubleup':
-                if dtype == 'ER':
-                    data = format(int(adr), "02x") + "0A"
-                else:
-                    return
-            elif msg.payload == b'doubledown':
-                if dtype == 'ER':
-                    data = format(int(adr), "02x") + "0B"
-                else:
-                    return
-            elif msg.payload == b'learn':
-                if dtype == 'ER':
-                    data = format(int(adr), "02x") + "0C"
-                else:
-                    return
-            elif msg.payload == b'onpulsemove':
-                if dtype == 'ER':
-                    data = format(int(adr), "02x") + "0D"
-                else:
-                    return
-            elif msg.payload == b'offpulsemove':
-                if dtype == 'ER':
-                    data = format(int(adr), "02x") + "0E"
-                else:
-                    return
-            elif msg.payload == b'asclose':
-                if dtype == 'ER':
-                    data = format(int(adr), "02x") + "0F"
-                else:
-                    return
-            elif msg.payload == b'asmove':
-                if dtype == 'ER':
-                    data = format(int(adr), "02x") + "10"
-                else:
-                    return
-            elif spayload.isnumeric():
-                #tilt
-                if dtype == 'ER':
-                    if int(spayload) > 0:
-                        data = format(int(adr), "02x") + "0A"   #double tap up
+
+            if dtype == 'IR':
+                # IR blinds use configured values for open/close/stop
+                if msg.payload == b'open' or msg.payload == b'up' or msg.payload == b'on':
+                    if 'open_value' in config['blinds'][ii]:
+                        data = config['blinds'][ii]['open_value']
                     else:
-                        data = format(int(adr), "02x") + "0B"   #double tap down
+                        print("Missing open_value for IR blind: " + adr)
+                        return
+                elif msg.payload == b'close' or msg.payload == b'down' or msg.payload == b'off':
+                    if 'close_value' in config['blinds'][ii]:
+                        data = config['blinds'][ii]['close_value']
+                    else:
+                        print("Missing close_value for IR blind: " + adr)
+                        return
+                elif msg.payload == b'stop':
+                    if 'stop_value' in config['blinds'][ii]:
+                        data = config['blinds'][ii]['stop_value']
+                    else:
+                        print("Missing stop_value for IR blind: " + adr)
+                        return
                 else:
+                    print("Wrong command for IR blind: " + str(msg.payload))
                     return
+
+                payload = {
+                    "XC_FNC" : "Send2",
+                    "type" : "CODE",
+                    "ir"   : "01",
+                    "code" : data
+                }
             else:
-                print("Wrong command: " + str(msg.payload))
-                return
-            payload = {
-              "XC_FNC" : "SendSC",
-              "type" : dtype,
-              "data" : data
-            }
+                if msg.payload == b'open':
+                    if dtype == 'RT':
+                        data = "20" + adr
+                    elif dtype == 'ER':
+                        data = format(int(adr), "02x") + "01"
+                    else:
+                        return
+                elif msg.payload == b'close':
+                    if dtype == 'RT':
+                        data = "40" + adr
+                    elif dtype == 'ER':
+                        data = format(int(adr), "02x") + "00"
+                    else:
+                        return
+                elif msg.payload == b'stop':
+                    if dtype == 'RT':
+                        data = "10" + adr
+                    elif dtype == 'ER':
+                        data = format(int(adr), "02x") + "02"
+                    else:
+                        return
+                # extended commands
+                elif msg.payload == b'down' or msg.payload == b'off':
+                    if dtype == 'RT':
+                        data = "40" + adr
+                    elif dtype == 'ER':
+                        data = format(int(adr), "02x") + "00"
+                    else:
+                        return
+                elif msg.payload == b'up' or msg.payload == b'on':
+                    if dtype == 'RT':
+                        data = "20" + adr
+                    elif dtype == 'ER':
+                        data = format(int(adr), "02x") + "01"
+                    else:
+                        return
+                elif msg.payload == b'upstep':
+                    if dtype == 'ER':
+                        data = format(int(adr), "02x") + "03"
+                    else:
+                        return
+                elif msg.payload == b'downstep':
+                    if dtype == 'ER':
+                        data = format(int(adr), "02x") + "04"
+                    else:
+                        return
+                elif msg.payload == b'manumode':
+                    if dtype == 'ER':
+                        data = format(int(adr), "02x") + "05"
+                    else:
+                        return
+                elif msg.payload == b'automode':
+                    if dtype == 'ER':
+                        data = format(int(adr), "02x") + "06"
+                    else:
+                        return
+                elif msg.payload == b'togglemode':
+                    if dtype == 'ER':
+                        data = format(int(adr), "02x") + "07"
+                    else:
+                        return
+                elif msg.payload == b'longup':
+                    if dtype == 'ER':
+                        data = format(int(adr), "02x") + "08"
+                    else:
+                        return
+                elif msg.payload == b'longdown':
+                    if dtype == 'ER':
+                        data = format(int(adr), "02x") + "09"
+                    else:
+                        return
+                elif msg.payload == b'doubleup':
+                    if dtype == 'ER':
+                        data = format(int(adr), "02x") + "0A"
+                    else:
+                        return
+                elif msg.payload == b'doubledown':
+                    if dtype == 'ER':
+                        data = format(int(adr), "02x") + "0B"
+                    else:
+                        return
+                elif msg.payload == b'learn':
+                    if dtype == 'ER':
+                        data = format(int(adr), "02x") + "0C"
+                    else:
+                        return
+                elif msg.payload == b'onpulsemove':
+                    if dtype == 'ER':
+                        data = format(int(adr), "02x") + "0D"
+                    else:
+                        return
+                elif msg.payload == b'offpulsemove':
+                    if dtype == 'ER':
+                        data = format(int(adr), "02x") + "0E"
+                    else:
+                        return
+                elif msg.payload == b'asclose':
+                    if dtype == 'ER':
+                        data = format(int(adr), "02x") + "0F"
+                    else:
+                        return
+                elif msg.payload == b'asmove':
+                    if dtype == 'ER':
+                        data = format(int(adr), "02x") + "10"
+                    else:
+                        return
+                elif spayload.isnumeric():
+                    #tilt
+                    if dtype == 'ER':
+                        if int(spayload) > 0:
+                            data = format(int(adr), "02x") + "0A"   #double tap up
+                        else:
+                            data = format(int(adr), "02x") + "0B"   #double tap down
+                    else:
+                        return
+                else:
+                    print("Wrong command: " + str(msg.payload))
+                    return
+
+                payload = {
+                  "XC_FNC" : "SendSC",
+                  "type" : dtype,
+                  "data" : data
+                }
+
             host = ''
             if isinstance(config['mediola'], list):
                 mediolaid = config['blinds'][ii]['mediola']
@@ -390,7 +432,15 @@ def setup_discovery():
 
     if 'blinds' in config:
         for ii in range(0, len(config['blinds'])):
-            identifier = config['blinds'][ii]['type'] + '_' + config['blinds'][ii]['adr']
+            btype = config['blinds'][ii]['type']
+            if 'adr' in config['blinds'][ii]:
+                adr = config['blinds'][ii]['adr']
+            elif btype == 'IR' and 'name' in config['blinds'][ii]:
+                adr = get_IR_address(config['blinds'][ii]['name'])
+            else:
+                print('Error: Cannot determine address for blind')
+                continue
+            identifier = btype + '_' + adr
             host = ''
             mediolaid = 'mediola'
             if isinstance(config['mediola'], list):
@@ -415,7 +465,6 @@ def setup_discovery():
               "command_topic" : topic + "/set",
               "payload_open" : "open",
               "payload_close" : "close",
-              "payload_stop" : "stop",
               "optimistic" : True,
               "device_class" : "blind",
               "unique_id" : mediolaid + '_' + identifier,
@@ -426,6 +475,9 @@ def setup_discovery():
                 "name" : "Mediola Blind",
               },
             }
+            # only add stop payload if supported (IR blinds may not have stop_value)
+            if btype != 'IR' or 'stop_value' in config['blinds'][ii]:
+                payload["payload_stop"] = "stop"
             # apply template if defined and override values
             if 'template' in config['blinds'][ii]:
                 template = config['blinds'][ii]['template']
@@ -440,7 +492,7 @@ def setup_discovery():
                                 payload[tpl_key] = tpl_value # s.format(**vars())
                             # supply tilt_command_topic if needed but missing
                             if 'tilt_command_topic' not in payload and ('tilt_opened_value' in payload or 'tilt_closed_value' in payload):
-                                payload['tilt_command_topic'] = payload['command_topic'] 
+                                payload['tilt_command_topic'] = payload['command_topic']
                             break
                         print(f"Missing template: {template}")
                     except BaseException as err:
@@ -448,7 +500,7 @@ def setup_discovery():
                         raise
                 else:
                     print(f"Missing section 'templates' to resolve template: {template}")
-            if config['blinds'][ii]['type'] == 'ER':
+            if btype == 'ER':
                 payload["state_topic"] = topic + "/state"
             payload = json.dumps(payload)
             mqttc.subscribe(topic + "/set")
