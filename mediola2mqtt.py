@@ -11,6 +11,7 @@ import os
 import sys
 import requests
 import threading
+import time
 
 if os.path.exists('/data/options.json'):
     print('Running in hass.io add-on mode')
@@ -34,6 +35,23 @@ else:
 # Track blind positions (identifier -> 0-100) and active movement timers
 blind_positions = {}
 blind_timers = {}
+# Track active movements: identifier -> {'start_time', 'start_pos', 'target_pos', 'travel_time'}
+blind_movements = {}
+
+def get_current_blind_position(identifier):
+    """Calculate the current position based on elapsed movement time."""
+    if identifier in blind_movements:
+        mov = blind_movements[identifier]
+        elapsed = time.monotonic() - mov['start_time']
+        total_duration = mov['travel_time'] * abs(mov['target_pos'] - mov['start_pos']) / 100.0
+        if total_duration <= 0:
+            return mov['target_pos']
+        progress = min(elapsed / total_duration, 1.0)
+        if mov['target_pos'] > mov['start_pos']:
+            return round(mov['start_pos'] + progress * (mov['target_pos'] - mov['start_pos']))
+        else:
+            return round(mov['start_pos'] - progress * (mov['start_pos'] - mov['target_pos']))
+    return blind_positions.get(identifier, 100)
 
 def send_blind_command(blind_cfg, adr, command, mediolaid):
     """Send open/close/stop command for a blind via HTTP. Returns True on success."""
@@ -105,24 +123,35 @@ def handle_blind_position(dtype, adr, mediolaid, spayload):
         mid = config['blinds'][ii]['mediola'] if isinstance(config['mediola'], list) else 'mediola'
         identifier = dtype + '_' + cadr
         pos_topic = config['mqtt']['topic'] + '/blinds/' + mid + '/' + identifier + '/position'
-        current = blind_positions.get(identifier, 100)
+        current = get_current_blind_position(identifier)
 
         if target == current:
             return
 
-        # Cancel any active movement timer
+        # Cancel any active movement timer and snapshot current position
         if identifier in blind_timers:
             blind_timers[identifier].cancel()
             blind_timers.pop(identifier, None)
+        blind_positions[identifier] = current
+        blind_movements.pop(identifier, None)
 
         direction = 'open' if target > current else 'close'
         duration = travel_time * abs(target - current) / 100.0
         send_blind_command(config['blinds'][ii], cadr, direction, mid)
 
+        # Record movement start for intermediate position calculation
+        blind_movements[identifier] = {
+            'start_time': time.monotonic(),
+            'start_pos': current,
+            'target_pos': target,
+            'travel_time': travel_time,
+        }
+
         def finish_position(ident=identifier, bcfg=config['blinds'][ii], c=cadr,
                             fp=target, m=mid, pt=pos_topic):
             send_blind_command(bcfg, c, 'stop', m)
             blind_positions[ident] = fp
+            blind_movements.pop(ident, None)
             mqttc.publish(pt, payload=str(fp), retain=True)
             blind_timers.pop(ident, None)
 
@@ -372,18 +401,29 @@ def on_message(client, obj, msg):
                 mid = mediolaid
                 identifier_key = dtype + '_' + cadr
                 pos_topic = config['mqtt']['topic'] + '/blinds/' + mid + '/' + identifier_key + '/position'
+                current = get_current_blind_position(identifier_key)
                 if identifier_key in blind_timers:
                     blind_timers[identifier_key].cancel()
                     blind_timers.pop(identifier_key, None)
+                blind_positions[identifier_key] = current
+                blind_movements.pop(identifier_key, None)
                 if blind_command == 'stop':
-                    mqttc.publish(pos_topic, payload=str(blind_positions.get(identifier_key, 100)), retain=True)
+                    mqttc.publish(pos_topic, payload=str(current), retain=True)
                 else:
                     final_pos = 100 if blind_command == 'open' else 0
+                    duration = travel_time * abs(final_pos - current) / 100.0
+                    blind_movements[identifier_key] = {
+                        'start_time': time.monotonic(),
+                        'start_pos': current,
+                        'target_pos': final_pos,
+                        'travel_time': travel_time,
+                    }
                     def _finish_full(ident=identifier_key, fp=final_pos, pt=pos_topic):
                         blind_positions[ident] = fp
+                        blind_movements.pop(ident, None)
                         mqttc.publish(pt, payload=str(fp), retain=True)
                         blind_timers.pop(ident, None)
-                    t = threading.Timer(travel_time, _finish_full)
+                    t = threading.Timer(duration, _finish_full)
                     blind_timers[identifier_key] = t
                     t.start()
 
