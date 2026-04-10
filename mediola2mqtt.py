@@ -725,7 +725,7 @@ def setup_discovery():
                         raise
                 else:
                     print(f"Missing section 'templates' to resolve template: {template}")
-            if btype == 'ER':
+            if btype == 'ER' or btype == 'RT':
                 payload["state_topic"] = topic + "/state"
             payload = json.dumps(payload)
             mqttc.subscribe(topic + "/set")
@@ -756,7 +756,13 @@ def handle_blind(packet_type, address, state, mediolaid):
     payload = False
 
     for ii in range(0, len(config['blinds'])):
-        if packet_type == 'ER' and packet_type == config['blinds'][ii]['type']:
+        blind_type = config['blinds'][ii]['type']
+        # ER status packets target ER blinds, R2 status packets target RT blinds
+        packet_matches_blind = (
+            (packet_type == 'ER' and blind_type == 'ER') or
+            (packet_type == 'R2' and blind_type == 'RT')
+        )
+        if packet_matches_blind:
             if address == config['blinds'][ii]['adr'].lower():
                 if isinstance(config['mediola'], list):
                     if config['blinds'][ii]['mediola'] != mediolaid:
@@ -764,16 +770,22 @@ def handle_blind(packet_type, address, state, mediolaid):
                 identifier = config['blinds'][ii]['type'] + '_' + config['blinds'][ii]['adr']
                 topic = config['mqtt']['topic'] + '/blinds/' + mediolaid + '/' + identifier + '/state'
                 payload = 'unknown'
-                if state == '01' or state == '0e':
-                    payload = 'open'
-                elif state == '02' or state == '0f':
-                    payload = 'closed'
-                elif state == '08' or state == '0a':
-                    payload = 'opening'
-                elif state == '09' or state == '0b':
-                    payload = 'closing'
-                elif state == '0d' or state == '05':
-                    payload = 'stopped'
+                if packet_type == 'ER':
+                    if state == '01' or state == '0e':
+                        payload = 'open'
+                    elif state == '02' or state == '0f':
+                        payload = 'closed'
+                    elif state == '08' or state == '0a':
+                        payload = 'opening'
+                    elif state == '09' or state == '0b':
+                        payload = 'closing'
+                    elif state == '0d' or state == '05':
+                        payload = 'stopped'
+                elif packet_type == 'R2':
+                    # For RT/R2 many gateways report coarse state values only.
+                    # 00:00 is commonly idle/stopped.
+                    if state in ('00:00', '00'):
+                        payload = 'stopped'
     return topic, payload, retain
 
 def get_mediolaid_by_address(addr):
@@ -822,11 +834,13 @@ def handle_packet_v6(data, addr):
     mediolaid = get_mediolaid_by_address(addr)
     packet_type = data_dict['type']
     address = data_dict['adr'].lower()
-    state = data_dict['state'][-2:].lower()
+    raw_state = data_dict['state'].lower()
+    state = raw_state[-2:] if packet_type == 'ER' else raw_state
     topic, payload, retain = handle_button(packet_type, address, state, mediolaid)
     if not topic:
+        blind_address = format(int(address, 16), '02d') if packet_type == 'ER' else address
         topic, payload, retain = handle_blind(packet_type,
-                         format(int(address, 16), '02d'),
+                         blind_address,
                          state,
                          mediolaid)
 
