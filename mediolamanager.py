@@ -205,8 +205,10 @@ class Ui(QtWidgets.QMainWindow):
             payload.update(data)
         print(payload)
         try:
-            response = requests.get(self.url, params=payload, headers={'Connection':'close'})
-        except:
+            response = requests.get(self.url, params=payload,
+                                    headers={'Connection': 'close'},
+                                    timeout=10)
+        except requests.RequestException:
             return False, ''
         message = ''
         if response.status_code == 200:

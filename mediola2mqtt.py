@@ -15,22 +15,28 @@ import time
 
 if os.path.exists('/data/options.json'):
     print('Running in hass.io add-on mode')
-    fp = open('/data/options.json', 'r')
-    config = json.load(fp)
-    fp.close()
+    with open('/data/options.json', 'r') as fp:
+        config = json.load(fp)
 elif os.path.exists('/config/mediola2mqtt.yaml'):
     print('Running in legacy add-on mode')
-    fp = open('/config/mediola2mqtt.yaml', 'r')
-    config = yaml.safe_load(fp)
-    fp.close()
+    with open('/config/mediola2mqtt.yaml', 'r') as fp:
+        config = yaml.safe_load(fp)
 elif os.path.exists('mediola2mqtt.yaml'):
     print('Running in local mode')
-    fp = open('mediola2mqtt.yaml', 'r')
-    config = yaml.safe_load(fp)
-    fp.close()
+    with open('mediola2mqtt.yaml', 'r') as fp:
+        config = yaml.safe_load(fp)
 else:
     print('Configuration file not found, exiting.')
     sys.exit(1)
+
+# Default HTTP timeout (seconds) for requests to the Mediola gateway. Without
+# this, a hung gateway can block MQTT callback threads indefinitely.
+HTTP_TIMEOUT = 10
+
+# Lock protecting blind_positions / blind_timers / blind_movements /
+# blind_progress_timers, since they are mutated from threading.Timer threads
+# as well as the MQTT callback thread.
+blind_state_lock = threading.RLock()
 
 # Track blind positions (identifier -> 0-100) and active movement timers
 blind_positions = {}
@@ -40,41 +46,66 @@ blind_movements = {}
 # Periodic position update timers for smoother percentage feedback in Home Assistant
 blind_progress_timers = {}
 
+def get_mediola(mediolaid):
+    """Return the Mediola config dict for the given id, or None if not found."""
+    if isinstance(config['mediola'], list):
+        for m in config['mediola']:
+            if m.get('id') == mediolaid:
+                return m
+        return None
+    return config['mediola']
+
+def apply_mediola_password(mediolaid, payload):
+    """Resolve the gateway host and stamp the password (if any) onto payload.
+    Returns the host string, or '' if no matching Mediola was found."""
+    m = get_mediola(mediolaid)
+    if not m:
+        return ''
+    if m.get('password'):
+        payload['XC_PASS'] = m['password']
+    return m.get('host', '')
+
 def get_blind_identifier(mediolaid, dtype, adr):
     return mediolaid + '_' + dtype + '_' + adr
 
 def get_current_blind_position(identifier):
     """Calculate the current position based on elapsed movement time."""
-    if identifier in blind_movements:
-        mov = blind_movements[identifier]
-        elapsed = time.monotonic() - mov['start_time']
-        total_duration = mov['travel_time'] * abs(mov['target_pos'] - mov['start_pos']) / 100.0
-        if total_duration <= 0:
-            return mov['target_pos']
-        progress = min(elapsed / total_duration, 1.0)
-        if mov['target_pos'] > mov['start_pos']:
-            return round(mov['start_pos'] + progress * (mov['target_pos'] - mov['start_pos']))
-        else:
+    with blind_state_lock:
+        mov = blind_movements.get(identifier)
+        if mov is not None:
+            elapsed = time.monotonic() - mov['start_time']
+            total_duration = mov['travel_time'] * abs(mov['target_pos'] - mov['start_pos']) / 100.0
+            if total_duration <= 0:
+                return mov['target_pos']
+            progress = min(elapsed / total_duration, 1.0)
+            if mov['target_pos'] > mov['start_pos']:
+                return round(mov['start_pos'] + progress * (mov['target_pos'] - mov['start_pos']))
             return round(mov['start_pos'] - progress * (mov['start_pos'] - mov['target_pos']))
-    return blind_positions.get(identifier, 100)
+        return blind_positions.get(identifier, 100)
 
 def start_blind_progress_updates(identifier, pos_topic):
     """Publish estimated blind position periodically while a timed movement is active."""
-    if identifier in blind_progress_timers:
-        blind_progress_timers[identifier].cancel()
-        blind_progress_timers.pop(identifier, None)
+    with blind_state_lock:
+        existing = blind_progress_timers.pop(identifier, None)
+    if existing is not None:
+        existing.cancel()
 
     def _publish_progress(ident=identifier, topic=pos_topic):
-        if ident not in blind_movements:
-            blind_progress_timers.pop(ident, None)
+        with blind_state_lock:
+            active = ident in blind_movements
+        if not active:
+            with blind_state_lock:
+                blind_progress_timers.pop(ident, None)
             return
         mqttc.publish(topic, payload=str(get_current_blind_position(ident)), retain=True)
         t = threading.Timer(1.0, _publish_progress, kwargs={'ident': ident, 'topic': topic})
-        blind_progress_timers[ident] = t
+        with blind_state_lock:
+            blind_progress_timers[ident] = t
         t.start()
 
     t = threading.Timer(1.0, _publish_progress)
-    blind_progress_timers[identifier] = t
+    with blind_state_lock:
+        blind_progress_timers[identifier] = t
     t.start()
 
 def send_blind_command(blind_cfg, adr, command, mediolaid):
@@ -95,23 +126,18 @@ def send_blind_command(blind_cfg, adr, command, mediolaid):
     else:
         return False
 
-    host = ''
-    if isinstance(config['mediola'], list):
-        for jj in range(len(config['mediola'])):
-            if mediolaid == config['mediola'][jj]['id']:
-                host = config['mediola'][jj]['host']
-                if 'password' in config['mediola'][jj] and config['mediola'][jj]['password'] != '':
-                    payload['XC_PASS'] = config['mediola'][jj]['password']
-                break
-    else:
-        host = config['mediola']['host']
-        if 'password' in config['mediola'] and config['mediola']['password'] != '':
-            payload['XC_PASS'] = config['mediola']['password']
-    if host == '':
+    host = apply_mediola_password(mediolaid, payload)
+    if not host:
         print('Error: Could not find matching Mediola!')
         return False
     url = 'http://' + host + '/command'
-    response = requests.get(url, params=payload, headers={'Connection': 'close'})
+    try:
+        response = requests.get(url, params=payload,
+                                headers={'Connection': 'close'},
+                                timeout=HTTP_TIMEOUT)
+    except requests.RequestException as err:
+        print(f"Error sending command to Mediola {host}: {err}")
+        return False
     if config['mqtt']['debug']:
         print(f"Send Mediola: {payload} --> {response.text}")
     return True
@@ -155,38 +181,42 @@ def handle_blind_position(dtype, adr, mediolaid, spayload):
             return
 
         # Cancel any active movement timer and snapshot current position
-        if identifier in blind_timers:
-            blind_timers[identifier].cancel()
-            blind_timers.pop(identifier, None)
-        blind_positions[identifier] = current
-        blind_movements.pop(identifier, None)
+        with blind_state_lock:
+            existing_timer = blind_timers.pop(identifier, None)
+            blind_positions[identifier] = current
+            blind_movements.pop(identifier, None)
+        if existing_timer is not None:
+            existing_timer.cancel()
 
         direction = 'open' if target > current else 'close'
         duration = travel_time * abs(target - current) / 100.0
         send_blind_command(config['blinds'][ii], cadr, direction, mid)
 
         # Record movement start for intermediate position calculation
-        blind_movements[identifier] = {
-            'start_time': time.monotonic(),
-            'start_pos': current,
-            'target_pos': target,
-            'travel_time': travel_time,
-        }
+        with blind_state_lock:
+            blind_movements[identifier] = {
+                'start_time': time.monotonic(),
+                'start_pos': current,
+                'target_pos': target,
+                'travel_time': travel_time,
+            }
         start_blind_progress_updates(identifier, pos_topic)
 
         def finish_position(ident=identifier, bcfg=config['blinds'][ii], c=cadr,
                             fp=target, m=mid, pt=pos_topic):
             send_blind_command(bcfg, c, 'stop', m)
-            blind_positions[ident] = fp
-            blind_movements.pop(ident, None)
-            if ident in blind_progress_timers:
-                blind_progress_timers[ident].cancel()
-                blind_progress_timers.pop(ident, None)
+            with blind_state_lock:
+                blind_positions[ident] = fp
+                blind_movements.pop(ident, None)
+                progress_timer = blind_progress_timers.pop(ident, None)
+                blind_timers.pop(ident, None)
+            if progress_timer is not None:
+                progress_timer.cancel()
             mqttc.publish(pt, payload=str(fp), retain=True)
-            blind_timers.pop(ident, None)
 
         t = threading.Timer(duration, finish_position)
-        blind_timers[identifier] = t
+        with blind_state_lock:
+            blind_timers[identifier] = t
         t.start()
         return
 
@@ -405,24 +435,20 @@ def on_message(client, obj, msg):
                   "data" : data
                 }
 
-            host = ''
             if isinstance(config['mediola'], list):
                 mediolaid = config['blinds'][ii]['mediola']
-                for jj in range(0, len(config['mediola'])):
-                    if mediolaid == config['mediola'][jj]['id']:
-                        host = config['mediola'][jj]['host']
-                        if 'password' in config['mediola'][jj] and config['mediola'][jj]['password'] != '':
-                            payload['XC_PASS'] = config['mediola'][jj]['password']
-                        break
-            else:
-                host = config['mediola']['host']
-                if 'password' in config['mediola'] and config['mediola']['password'] != '':
-                   payload['XC_PASS'] = config['mediola']['password']
-            if host == '':
+            host = apply_mediola_password(mediolaid, payload)
+            if not host:
                 print('Error: Could not find matching Mediola!')
                 return
             url = 'http://' + host + '/command'
-            response = requests.get(url, params=payload, headers={'Connection':'close'})
+            try:
+                response = requests.get(url, params=payload,
+                                        headers={'Connection': 'close'},
+                                        timeout=HTTP_TIMEOUT)
+            except requests.RequestException as err:
+                print(f"Error sending command to Mediola {host}: {err}")
+                return
             if config['mqtt']['debug']:
                 print(f"Send Mediola: {payload} --> {response.text}")
 
@@ -434,36 +460,41 @@ def on_message(client, obj, msg):
                 topic_identifier = dtype + '_' + cadr
                 pos_topic = config['mqtt']['topic'] + '/blinds/' + mid + '/' + topic_identifier + '/position'
                 current = get_current_blind_position(identifier_key)
-                if identifier_key in blind_timers:
-                    blind_timers[identifier_key].cancel()
-                    blind_timers.pop(identifier_key, None)
-                blind_positions[identifier_key] = current
-                blind_movements.pop(identifier_key, None)
+                with blind_state_lock:
+                    existing_timer = blind_timers.pop(identifier_key, None)
+                    blind_positions[identifier_key] = current
+                    blind_movements.pop(identifier_key, None)
+                if existing_timer is not None:
+                    existing_timer.cancel()
                 if blind_command == 'stop':
-                    if identifier_key in blind_progress_timers:
-                        blind_progress_timers[identifier_key].cancel()
-                        blind_progress_timers.pop(identifier_key, None)
+                    with blind_state_lock:
+                        progress_timer = blind_progress_timers.pop(identifier_key, None)
+                    if progress_timer is not None:
+                        progress_timer.cancel()
                     mqttc.publish(pos_topic, payload=str(current), retain=True)
                 else:
                     final_pos = 100 if blind_command == 'open' else 0
                     duration = travel_time * abs(final_pos - current) / 100.0
-                    blind_movements[identifier_key] = {
-                        'start_time': time.monotonic(),
-                        'start_pos': current,
-                        'target_pos': final_pos,
-                        'travel_time': travel_time,
-                    }
+                    with blind_state_lock:
+                        blind_movements[identifier_key] = {
+                            'start_time': time.monotonic(),
+                            'start_pos': current,
+                            'target_pos': final_pos,
+                            'travel_time': travel_time,
+                        }
                     start_blind_progress_updates(identifier_key, pos_topic)
                     def _finish_full(ident=identifier_key, fp=final_pos, pt=pos_topic):
-                        blind_positions[ident] = fp
-                        blind_movements.pop(ident, None)
-                        if ident in blind_progress_timers:
-                            blind_progress_timers[ident].cancel()
-                            blind_progress_timers.pop(ident, None)
+                        with blind_state_lock:
+                            blind_positions[ident] = fp
+                            blind_movements.pop(ident, None)
+                            progress_timer = blind_progress_timers.pop(ident, None)
+                            blind_timers.pop(ident, None)
+                        if progress_timer is not None:
+                            progress_timer.cancel()
                         mqttc.publish(pt, payload=str(fp), retain=True)
-                        blind_timers.pop(ident, None)
                     t = threading.Timer(duration, _finish_full)
-                    blind_timers[identifier_key] = t
+                    with blind_state_lock:
+                        blind_timers[identifier_key] = t
                     t.start()
 
     for ii in range(0, len(config['switches'])):
@@ -523,24 +554,20 @@ def on_message(client, obj, msg):
                     "ir"   : "01",
                     "code" : data
                 }
-            host = ''
             if isinstance(config['mediola'], list):
                 mediolaid = config['switches'][ii]['mediola']
-                for jj in range(0, len(config['mediola'])):
-                    if mediolaid == config['mediola'][jj]['id']:
-                        host = config['mediola'][jj]['host']
-                        if 'password' in config['mediola'][jj] and config['mediola'][jj]['password'] != '':
-                            payload['XC_PASS'] = config['mediola'][jj]['password']
-                        break
-            else:
-                host = config['mediola']['host']
-                if 'password' in config['mediola'] and config['mediola']['password'] != '':
-                    payload['XC_PASS'] = config['mediola']['password']
-            if host == '':
+            host = apply_mediola_password(mediolaid, payload)
+            if not host:
                 print('Error: Could not find matching Mediola!')
                 return
             url = 'http://' + host + '/command'
-            response = requests.get(url, params=payload, headers={'Connection':'close'})
+            try:
+                response = requests.get(url, params=payload,
+                                        headers={'Connection': 'close'},
+                                        timeout=HTTP_TIMEOUT)
+            except requests.RequestException as err:
+                print(f"Error sending command to Mediola {host}: {err}")
+                return
             if config['mqtt']['debug']:
                 print(f"Send Mediola: {payload} --> {response.text}")
 
@@ -556,21 +583,24 @@ def on_subscribe(client, obj, mid, granted_qos):
 def on_log(client, obj, level, string):
     print(string)
 
+def _resolve_mediolaid_and_host(item):
+    """Return (mediolaid, host) for a configured device, or (None, None)."""
+    if isinstance(config['mediola'], list):
+        mediolaid = item.get('mediola')
+    else:
+        mediolaid = 'mediola'
+    m = get_mediola(mediolaid)
+    if not m:
+        return None, None
+    return mediolaid, m.get('host', '')
+
 def setup_discovery():
     if 'buttons' in config:
         # Buttons are configured as MQTT device triggers
         for ii in range(0, len(config['buttons'])):
             identifier = config['buttons'][ii]['type'] + '_' + config['buttons'][ii]['adr']
-            host = ''
-            mediolaid = 'mediola'
-            if isinstance(config['mediola'], list):
-                mediolaid = config['buttons'][ii]['mediola']
-                for jj in range(0, len(config['mediola'])):
-                    if mediolaid == config['mediola'][jj]['id']:
-                        host = config['mediola'][jj]['host']
-            else:
-                host = config['mediola']['host']
-            if host == '':
+            mediolaid, host = _resolve_mediolaid_and_host(config['buttons'][ii])
+            if not host:
                 print('Error: Could not find matching Mediola!')
                 continue
             deviceid = "mediola_buttons_" + host.replace(".", "")
@@ -597,27 +627,19 @@ def setup_discovery():
 
     if 'switches' in config:
         for ii in range(0, len(config['switches'])):
-            type = config['switches'][ii]['type']
+            stype = config['switches'][ii]['type']
 
             if 'adr' in config['switches'][ii]:
                 adr = config['switches'][ii]['adr']
-            elif type == "IT":
+            elif stype == "IT":
                 adr = get_IT_address(config['switches'][ii]['on_value'])
 
-            elif type == "IR" and 'name' in config['switches'][ii]:
+            elif stype == "IR" and 'name' in config['switches'][ii]:
                 adr = get_IR_address(config['switches'][ii]['name'])
 
-            identifier = type + '_' + adr
-            host = ''
-            mediolaid = 'mediola'
-            if isinstance(config['mediola'], list):
-                mediolaid = config['switches'][ii]['mediola']
-                for jj in range(0, len(config['mediola'])):
-                    if mediolaid == config['mediola'][jj]['id']:
-                        host = config['mediola'][jj]['host']
-            else:
-                host = config['mediola']['host']
-            if host == '':
+            identifier = stype + '_' + adr
+            mediolaid, host = _resolve_mediolaid_and_host(config['switches'][ii])
+            if not host:
                 print('Error: Could not find matching Mediola!')
                 continue
             deviceid = "mediola_switches_" + host.replace(".", "")
@@ -659,16 +681,8 @@ def setup_discovery():
                 print('Error: Cannot determine address for blind')
                 continue
             identifier = btype + '_' + adr
-            host = ''
-            mediolaid = 'mediola'
-            if isinstance(config['mediola'], list):
-                mediolaid = config['blinds'][ii]['mediola']
-                for jj in range(0, len(config['mediola'])):
-                    if mediolaid == config['mediola'][jj]['id']:
-                        host = config['mediola'][jj]['host']
-            else:
-                host = config['mediola']['host']
-            if host == '':
+            mediolaid, host = _resolve_mediolaid_and_host(config['blinds'][ii])
+            if not host:
                 print('Error: Could not find matching Mediola!')
                 continue
             deviceid = "mediola_blinds_" + host.replace(".", "")
@@ -720,7 +734,7 @@ def setup_discovery():
                             break
                         if not template_found:
                             print(f"Missing template: {template}")
-                    except BaseException as err:
+                    except Exception as err:
                         print(f"Unexpected {err=}, {type(err)=}")
                         raise
                 else:
@@ -788,23 +802,36 @@ def handle_blind(packet_type, address, state, mediolaid):
                         payload = 'stopped'
     return topic, payload, retain
 
-def get_mediolaid_by_address(addr):
-    mediolaid = 'mediola'
-    if not isinstance(config['mediola'], list):
-        return mediolaid
+_mediola_host_ip_cache = {}
 
-    for ii in range(0, len(config['mediola'])):
-        host = config['mediola'][ii]['host']
+def _resolve_host_ip(host):
+    """Cached gethostbyname so we don't hit DNS for every UDP packet."""
+    cached = _mediola_host_ip_cache.get(host)
+    if cached is not None:
+        return cached
+    try:
         ipaddr = socket.gethostbyname(host)
-        if addr[0] == ipaddr:
-            mediolaid = config['mediola'][ii]['id']
+    except socket.gaierror as err:
+        print(f"DNS lookup failed for {host}: {err}")
+        return None
+    _mediola_host_ip_cache[host] = ipaddr
+    return ipaddr
 
-    return mediolaid
+def get_mediolaid_by_address(addr):
+    if not isinstance(config['mediola'], list):
+        return 'mediola'
+    src_ip = addr[0]
+    for entry in config['mediola']:
+        host = entry['host']
+        ipaddr = _resolve_host_ip(host)
+        if ipaddr is not None and src_ip == ipaddr:
+            return entry['id']
+    return 'mediola'
 
 def handle_packet_v4(data, addr):
     try:
         data_dict = json.loads(data)
-    except:
+    except (ValueError, TypeError):
         return False
 
     mediolaid = get_mediolaid_by_address(addr)
@@ -828,7 +855,7 @@ def handle_packet_v4(data, addr):
 def handle_packet_v6(data, addr):
     try:
         data_dict = json.loads(data)
-    except:
+    except (ValueError, TypeError):
         return False
 
     mediolaid = get_mediolaid_by_address(addr)
@@ -891,8 +918,8 @@ if config['mqtt']['username'] and config['mqtt']['password']:
     mqttc.username_pw_set(config['mqtt']['username'], config['mqtt']['password'])
 try:
     mqttc.connect(config['mqtt']['host'], config['mqtt']['port'], 60)
-except:
-    print('Error connecting to MQTT, will now quit.')
+except (OSError, ConnectionError) as err:
+    print(f'Error connecting to MQTT ({err}), will now quit.')
     sys.exit(1)
 mqttc.loop_start()
 
@@ -902,26 +929,43 @@ if 'general' in config:
         listen_port = config['general']['port']
 
 sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-sock.bind(('',listen_port))
+sock.bind(('', listen_port))
 
-#setup_discovery()
+try:
+    while True:
+        data, addr = sock.recvfrom(1024)
+        if config['mqtt']['debug']:
+            print('Received message: %s' % data)
+        mqttc.publish(config['mqtt']['topic'], payload=data, retain=False)
 
-while True:
-    valid = False
-    data, addr = sock.recvfrom(1024)
-    if config['mqtt']['debug']:
-        print('Received message: %s' % data)
-    mqttc.publish(config['mqtt']['topic'], payload=data, retain=False)
-
-    # For the v4 (and probably v5) gateways, the status packet starts
-    # with '{XC_EVT}', but for the v6 it starts with 'STA:'.
-    if data.startswith(b'{XC_EVT}'):
-        data = data.replace(b'{XC_EVT}', b'')
-        if not handle_packet_v4(data, addr):
-            if config['mqtt']['debug']:
-                print('Error handling v4 packet: %s' % data)
-    elif data.startswith(b'STA:'):
-        data = data.replace(b'STA:', b'')
-        if not handle_packet_v6(data, addr):
-            if config['mqtt']['debug']:
-                print('Error handling v6 packet: %s' % data)
+        # For the v4 (and probably v5) gateways, the status packet starts
+        # with '{XC_EVT}', but for the v6 it starts with 'STA:'.
+        if data.startswith(b'{XC_EVT}'):
+            data = data.replace(b'{XC_EVT}', b'')
+            if not handle_packet_v4(data, addr):
+                if config['mqtt']['debug']:
+                    print('Error handling v4 packet: %s' % data)
+        elif data.startswith(b'STA:'):
+            data = data.replace(b'STA:', b'')
+            if not handle_packet_v6(data, addr):
+                if config['mqtt']['debug']:
+                    print('Error handling v6 packet: %s' % data)
+except KeyboardInterrupt:
+    print('Shutting down.')
+finally:
+    with blind_state_lock:
+        for t in list(blind_timers.values()):
+            t.cancel()
+        for t in list(blind_progress_timers.values()):
+            t.cancel()
+        blind_timers.clear()
+        blind_progress_timers.clear()
+    try:
+        sock.close()
+    except OSError:
+        pass
+    mqttc.loop_stop()
+    try:
+        mqttc.disconnect()
+    except Exception:
+        pass
