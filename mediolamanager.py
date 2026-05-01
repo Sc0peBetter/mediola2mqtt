@@ -114,6 +114,10 @@ class Ui(QtWidgets.QMainWindow):
         self.gatewayDisconnected()
         
     def gatewayDisconnected(self):
+        # Reset connection state so a stale URL/version isn't used after disconnect
+        self.url = ''
+        self.version = 4
+        self.devices = []
         self.findChild(QObject, 'btnEleroManager').setEnabled(False)
         self.findChild(QObject, 'btnAddDevice').setEnabled(False)
         self.findChild(QObject, 'btnDeleteDevice').setEnabled(False)
@@ -132,7 +136,10 @@ class Ui(QtWidgets.QMainWindow):
         self.addDevice.show()
         
     def delDevice(self):
-        pass
+        # Not yet implemented; keep button responsive but signal to the user.
+        statusbar = self.findChild(QObject, 'statusbar')
+        if statusbar is not None:
+            statusbar.showMessage('Delete device is not yet implemented.')
         
     def eleroManager(self):
         self.eleroManager.show()
@@ -144,19 +151,27 @@ class Ui(QtWidgets.QMainWindow):
             if text.startswith('{XC_SUC}'):
                 text = text.replace('{XC_SUC}', '')
                 if len(text) > 0:
-                    ret = json.loads(text)
+                    try:
+                        ret = json.loads(text)
+                    except ValueError:
+                        return False, ''
                 res = True
             elif text.startswith('{XC_ERR}'):
-                text = text.replace('{XC_ERR}', '')
-                ret = text
+                ret = text.replace('{XC_ERR}', '')
                 res = False
         elif self.version == 5:
-            ret = json.loads(text)
-            if 'XC_SUC' in ret:
+            try:
+                ret = json.loads(text)
+            except ValueError:
+                return False, ''
+            if isinstance(ret, dict) and 'XC_SUC' in ret:
                 ret = ret['XC_SUC']
                 res = True
-            else:
+            elif isinstance(ret, dict) and 'XC_ERR' in ret:
                 ret = ret['XC_ERR']
+                res = False
+            else:
+                ret = ''
                 res = False
         return res, ret
         
