@@ -1,5 +1,6 @@
-"""Tests for _send_gateway_request — HTTP status handling."""
+"""Tests for _send_gateway_request — HTTP status handling and logging."""
 
+import logging
 import unittest
 from unittest import mock
 
@@ -24,31 +25,56 @@ class SendGatewayRequestTests(unittest.TestCase):
             self.assertTrue(self.m._send_gateway_request(
                 {"XC_FNC": "Send2"}, 'mediola1'))
 
-    def test_4xx_response_returns_false(self):
+    def test_4xx_response_returns_false_and_warns(self):
         with mock.patch.object(self.m.requests, 'get',
                                return_value=_FakeResponse(404, 'not found')):
-            self.assertFalse(self.m._send_gateway_request(
-                {"XC_FNC": "Send2"}, 'mediola1'))
+            with self.assertLogs(self.m.logger, level='WARNING') as captured:
+                self.assertFalse(self.m._send_gateway_request(
+                    {"XC_FNC": "Send2"}, 'mediola1'))
+        self.assertEqual(captured.records[0].levelno, logging.WARNING)
+        self.assertIn('404', captured.output[0])
 
-    def test_5xx_response_returns_false(self):
+    def test_5xx_response_returns_false_and_errors(self):
         with mock.patch.object(self.m.requests, 'get',
                                return_value=_FakeResponse(500, 'boom')):
-            self.assertFalse(self.m._send_gateway_request(
-                {"XC_FNC": "Send2"}, 'mediola1'))
+            with self.assertLogs(self.m.logger, level='WARNING') as captured:
+                self.assertFalse(self.m._send_gateway_request(
+                    {"XC_FNC": "Send2"}, 'mediola1'))
+        self.assertEqual(captured.records[0].levelno, logging.ERROR)
+        self.assertIn('500', captured.output[0])
 
-    def test_request_exception_returns_false(self):
+    def test_request_exception_returns_false_and_errors(self):
         with mock.patch.object(self.m.requests, 'get',
                                side_effect=self.m.requests.ConnectionError(
                                    'no route')):
-            self.assertFalse(self.m._send_gateway_request(
-                {"XC_FNC": "Send2"}, 'mediola1'))
+            with self.assertLogs(self.m.logger, level='WARNING') as captured:
+                self.assertFalse(self.m._send_gateway_request(
+                    {"XC_FNC": "Send2"}, 'mediola1'))
+        self.assertEqual(captured.records[0].levelno, logging.ERROR)
+        self.assertIn('no route', captured.output[0])
 
-    def test_unknown_mediolaid_returns_false(self):
+    def test_unknown_mediolaid_returns_false_and_errors(self):
         # No HTTP call expected because host resolution fails first.
         with mock.patch.object(self.m.requests, 'get') as mocked:
-            self.assertFalse(self.m._send_gateway_request(
-                {"XC_FNC": "Send2"}, 'does-not-exist'))
+            with self.assertLogs(self.m.logger, level='WARNING') as captured:
+                self.assertFalse(self.m._send_gateway_request(
+                    {"XC_FNC": "Send2"}, 'does-not-exist'))
             mocked.assert_not_called()
+        self.assertEqual(captured.records[0].levelno, logging.ERROR)
+
+    def test_non_2xx_does_not_leak_xc_pass(self):
+        """Redaction must still apply to the body+payload log line."""
+        # mediola1 has no password; inject one to verify redaction.
+        with mock.patch.object(self.m, 'get_mediola',
+                               return_value={'host': '192.0.2.10',
+                                             'password': 'super-secret'}):
+            with mock.patch.object(self.m.requests, 'get',
+                                   return_value=_FakeResponse(403, 'nope')):
+                with self.assertLogs(self.m.logger, level='WARNING') as cap:
+                    self.assertFalse(self.m._send_gateway_request(
+                        {"XC_FNC": "Send2"}, 'mediola1'))
+        self.assertNotIn('super-secret', cap.output[0])
+        self.assertIn('***', cap.output[0])
 
 
 if __name__ == '__main__':

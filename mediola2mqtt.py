@@ -7,6 +7,7 @@ import paho.mqtt.client as mqtt
 import socket
 import json
 import yaml
+import logging
 import os
 import sys
 import requests
@@ -14,6 +15,12 @@ import threading
 import time
 import itertools
 import signal
+
+# Module logger. A NullHandler keeps tests / library imports silent until the
+# script's main() configures the root logger via basicConfig, at which point
+# records propagate to stderr/stdout as usual.
+logger = logging.getLogger(__name__)
+logger.addHandler(logging.NullHandler())
 
 if os.path.exists('/data/options.json'):
     print('Running in hass.io add-on mode')
@@ -105,7 +112,7 @@ def _send_gateway_request(payload, mediolaid):
     """Send payload to the resolved Mediola gateway. Returns True on success."""
     host = apply_mediola_password(mediolaid, payload)
     if not host:
-        print('Error: Could not find matching Mediola!')
+        logger.error("Could not find matching Mediola for id=%r", mediolaid)
         return False
     url = 'http://' + host + '/command'
     try:
@@ -113,16 +120,23 @@ def _send_gateway_request(payload, mediolaid):
                                 headers={'Connection': 'close'},
                                 timeout=HTTP_TIMEOUT)
     except requests.RequestException as err:
-        print(f"Error sending command to Mediola {host}: {err}")
+        logger.error("Error sending command to Mediola %s: %s", host, err)
         return False
     if not response.ok:
         # Truncate body so a misbehaving gateway can't flood the log.
         body = (response.text or '')[:500]
-        print(f"Mediola {host} returned HTTP {response.status_code} for "
-              f"{_redact_payload(payload)}: {body}")
+        # 5xx is a server fault, 4xx is a client/protocol fault — both fail
+        # the command, but a 5xx is more actionable for ops.
+        log_level = (logging.ERROR if response.status_code >= 500
+                     else logging.WARNING)
+        logger.log(log_level,
+                   "Mediola %s returned HTTP %s for %s: %s",
+                   host, response.status_code,
+                   _redact_payload(payload), body)
         return False
     if config['mqtt'].get('debug'):
-        print(f"Send Mediola: {_redact_payload(payload)} --> {response.text}")
+        logger.debug("Send Mediola: %s --> %s",
+                     _redact_payload(payload), response.text)
     return True
 
 
@@ -483,7 +497,8 @@ def _build_switch_payload(cfg, dtype, adr, msg_payload):
         try:
             device_code = int(adr[1:]) - 1
         except ValueError:
-            print(f"Invalid IT address (non-numeric device code): {adr}")
+            logger.warning(
+                "Invalid IT address (non-numeric device code): %r", adr)
             return None
         data = (format((ord(adr[0].upper()) - 65), 'X')
                 + format(device_code, 'X')
@@ -1033,6 +1048,15 @@ def _shutdown_handler(signum, frame):
 def main():
     """Set up MQTT and run the UDP listen loop. Runs until shutdown."""
     global mqttc
+
+    # Configure the root logger only when run as a script. basicConfig is a
+    # no-op if the root logger already has handlers (e.g. set up by an
+    # embedding host), so this is safe to call unconditionally.
+    log_level = logging.DEBUG if config['mqtt'].get('debug') else logging.INFO
+    logging.basicConfig(
+        level=log_level,
+        format='%(asctime)s %(levelname)s %(name)s: %(message)s',
+    )
 
     # Rebuild indexes in case the config was reloaded between import and run.
     _build_indexes()

@@ -19,16 +19,21 @@ class ITSwitchAddressTests(unittest.TestCase):
             'XC_FNC': 'SendSC', 'type': 'IT', 'data': '00E',
         })
 
-    def test_non_numeric_it_address_returns_none(self):
+    def test_non_numeric_it_address_returns_none_and_warns(self):
         # The fallback path int(adr[1:]) used to raise ValueError and crash
-        # the whole MQTT callback. It must now log and return None.
-        result = self.m._build_switch_payload(
-            cfg={'type': 'IT'}, dtype='IT', adr='AXX', msg_payload=b'ON')
+        # the whole MQTT callback. It must now log a WARNING and return None.
+        import logging as _logging
+        with self.assertLogs(self.m.logger, level='WARNING') as captured:
+            result = self.m._build_switch_payload(
+                cfg={'type': 'IT'}, dtype='IT', adr='AXX', msg_payload=b'ON')
         self.assertIsNone(result)
+        self.assertEqual(captured.records[0].levelno, _logging.WARNING)
+        self.assertIn('AXX', captured.output[0])
 
     def test_non_numeric_off_command_returns_none(self):
-        result = self.m._build_switch_payload(
-            cfg={'type': 'IT'}, dtype='IT', adr='ABC', msg_payload=b'OFF')
+        with self.assertLogs(self.m.logger, level='WARNING'):
+            result = self.m._build_switch_payload(
+                cfg={'type': 'IT'}, dtype='IT', adr='ABC', msg_payload=b'OFF')
         self.assertIsNone(result)
 
     def test_on_message_with_non_numeric_address_does_not_raise(self):
