@@ -59,6 +59,19 @@ _movement_gen = itertools.count(1)
 # Coordinated shutdown flag for the main UDP loop.
 _shutdown_event = threading.Event()
 
+# Lookup indexes for O(1) device dispatch. Built by _build_indexes() after
+# the config has been loaded. Keys are tuples: (mediolaid, dtype, adr)
+# (case preserved for command paths; lowercased for status paths since
+# status packets carry lowercase addresses).
+_blind_command_index = {}   # (mediolaid, dtype, adr) -> blind cfg
+_blind_status_index = {}    # (mediolaid, packet_type, adr.lower()) -> blind cfg
+_switch_command_index = {}  # (mediolaid, dtype, adr) -> switch cfg
+_button_index = {}          # (mediolaid, packet_type, adr.lower()) -> button cfg
+
+# Populated by main() so functions can reference it as a module global. Tests
+# that import the module without running main() simply don't touch it.
+mqttc = None
+
 
 def _redact_payload(payload):
     """Return a copy of payload with XC_PASS scrubbed for safe logging."""
@@ -101,6 +114,12 @@ def _send_gateway_request(payload, mediolaid):
                                 timeout=HTTP_TIMEOUT)
     except requests.RequestException as err:
         print(f"Error sending command to Mediola {host}: {err}")
+        return False
+    if not response.ok:
+        # Truncate body so a misbehaving gateway can't flood the log.
+        body = (response.text or '')[:500]
+        print(f"Mediola {host} returned HTTP {response.status_code} for "
+              f"{_redact_payload(payload)}: {body}")
         return False
     if config['mqtt'].get('debug'):
         print(f"Send Mediola: {_redact_payload(payload)} --> {response.text}")
@@ -277,56 +296,45 @@ def handle_blind_position(dtype, adr, mediolaid, spayload):
         print(f"Invalid position value: {spayload}")
         return
 
-    for cfg in config.get('blinds', []):
-        if cfg.get('type') != dtype:
-            continue
-        cadr = cfg.get('adr')
-        if cadr is None and dtype == 'IR' and 'name' in cfg:
-            cadr = get_IR_address(cfg['name'])
-        if cadr is None:
-            continue
-        if adr != cadr:
-            continue
-        if isinstance(config['mediola'], list):
-            if cfg.get('mediola') != mediolaid:
-                continue
-
-        travel_time = cfg.get('travel_time', 0)
-        if not travel_time:
-            print(f"No travel_time configured for blind: {adr}")
-            return
-
-        # IR blinds without stop_value cannot honor an intermediate target;
-        # the timed movement would never be terminated.
-        if cfg.get('type') == 'IR' and 'stop_value' not in cfg:
-            print(f"Cannot set position for IR blind without stop_value: {adr}")
-            return
-
-        mid = cfg['mediola'] if isinstance(config['mediola'], list) else 'mediola'
-        identifier = get_blind_identifier(mid, dtype, cadr)
-        topic_identifier = dtype + '_' + cadr
-        pos_topic = config['mqtt']['topic'] + '/blinds/' + mid + '/' + topic_identifier + '/position'
-        current = get_current_blind_position(identifier)
-
-        # If a movement is in progress and the user requests the currently
-        # estimated position as the target, treat it as 'stop here'.
-        if target == current:
-            with blind_state_lock:
-                mov_active = identifier in blind_movements
-            if mov_active:
-                _clear_movement_state(identifier, snapshot_pos=current)
-                send_blind_command(cfg, cadr, 'stop', mid)
-                _safe_publish(pos_topic, str(current), retain=True)
-            return
-
-        _clear_movement_state(identifier, snapshot_pos=current)
-        direction = 'open' if target > current else 'close'
-        if not send_blind_command(cfg, cadr, direction, mid):
-            return
-        _begin_movement(identifier, pos_topic, current, target, travel_time,
-                        send_stop_at_end=True, blind_cfg=cfg, adr=cadr,
-                        mediolaid=mid)
+    cfg = _blind_command_index.get((mediolaid, dtype, adr))
+    if cfg is None:
         return
+
+    travel_time = cfg.get('travel_time', 0)
+    if not travel_time:
+        print(f"No travel_time configured for blind: {adr}")
+        return
+
+    # IR blinds without stop_value cannot honor an intermediate target;
+    # the timed movement would never be terminated.
+    if cfg.get('type') == 'IR' and 'stop_value' not in cfg:
+        print(f"Cannot set position for IR blind without stop_value: {adr}")
+        return
+
+    identifier = get_blind_identifier(mediolaid, dtype, adr)
+    topic_identifier = dtype + '_' + adr
+    pos_topic = (config['mqtt']['topic'] + '/blinds/' + mediolaid + '/'
+                 + topic_identifier + '/position')
+    current = get_current_blind_position(identifier)
+
+    # If a movement is in progress and the user requests the currently
+    # estimated position as the target, treat it as 'stop here'.
+    if target == current:
+        with blind_state_lock:
+            mov_active = identifier in blind_movements
+        if mov_active:
+            _clear_movement_state(identifier, snapshot_pos=current)
+            send_blind_command(cfg, adr, 'stop', mediolaid)
+            _safe_publish(pos_topic, str(current), retain=True)
+        return
+
+    _clear_movement_state(identifier, snapshot_pos=current)
+    direction = 'open' if target > current else 'close'
+    if not send_blind_command(cfg, adr, direction, mediolaid):
+        return
+    _begin_movement(identifier, pos_topic, current, target, travel_time,
+                    send_stop_at_end=True, blind_cfg=cfg, adr=adr,
+                    mediolaid=mediolaid)
 
 
 # Define MQTT event callbacks
@@ -353,7 +361,7 @@ def on_disconnect(client, userdata, rc):
 
 
 def _parse_command_topic(topic):
-    """Parse a command topic into (mediolaid, dtype, adr, is_position).
+    """Parse a command topic into (category, mediolaid, dtype, adr, is_position).
 
     Returns None if the topic doesn't match an expected command shape.
     Expected shapes (base topic may itself contain '/'):
@@ -362,52 +370,33 @@ def _parse_command_topic(topic):
     Parses structurally so that '_' inside <mediolaid> or <base> is safe.
     """
     parts = topic.split('/')
-    if len(parts) < 4 or parts[-1] != 'set':
+    if len(parts) < 5 or parts[-1] != 'set':
         return None
     if parts[-2] == 'position':
-        if len(parts) < 5:
+        if len(parts) < 6:
             return None
-        device_segment = parts[-3]
+        category = parts[-5]
         mediolaid = parts[-4]
+        device_segment = parts[-3]
         is_position = True
     else:
-        device_segment = parts[-2]
+        category = parts[-4]
         mediolaid = parts[-3]
+        device_segment = parts[-2]
         is_position = False
+    if not category:
+        return None
     if '_' not in device_segment:
         return None
     dtype, _, adr = device_segment.partition('_')
     if not dtype or not adr:
         return None
-    return mediolaid, dtype, adr, is_position
+    return category, mediolaid, dtype, adr, is_position
 
 
-def on_message(client, obj, msg):
-    spayload = msg.payload.decode(errors='replace')
-    print("Msg: " + msg.topic + " " + str(msg.qos) + " " + str(msg.payload))
-
-    parsed = _parse_command_topic(msg.topic)
-    if parsed is None:
-        print(f"Ignoring unrecognized topic: {msg.topic}")
-        return
-    mediolaid, dtype, adr, is_position = parsed
-
-    # Determine basic direction for position tracking
-    if msg.payload in (b'open', b'up', b'on'):
-        blind_command = 'open'
-    elif msg.payload in (b'close', b'down', b'off'):
-        blind_command = 'close'
-    elif msg.payload == b'stop':
-        blind_command = 'stop'
-    else:
-        blind_command = None
-
-    # Route position commands to dedicated handler
-    if is_position:
-        handle_blind_position(dtype, adr, mediolaid, spayload)
-        return
-
-    # ER opcode lookup table (full map of supported commands)
+def _build_blind_payload(cfg, dtype, adr, msg_payload, spayload):
+    """Return the gateway payload for a blind command, or None on validation
+    failure. Logs the reason for failure."""
     er_opcodes = {
         b'open': '01', b'up': '01', b'on': '01',
         b'close': '00', b'down': '00', b'off': '00',
@@ -425,149 +414,177 @@ def on_message(client, obj, msg):
         b'stop': '10',
     }
 
-    for cfg in config.get('blinds', []):
-        # get address of configured blind
-        if 'adr' in cfg:
-            cadr = cfg['adr']
-        elif dtype == 'IR' and 'name' in cfg:
-            cadr = get_IR_address(cfg['name'])
+    if dtype == 'IR':
+        if msg_payload in (b'open', b'up', b'on'):
+            if 'open_value' not in cfg:
+                print("Missing open_value for IR blind: " + adr)
+                return None
+            data = cfg['open_value']
+        elif msg_payload in (b'close', b'down', b'off'):
+            if 'close_value' not in cfg:
+                print("Missing close_value for IR blind: " + adr)
+                return None
+            data = cfg['close_value']
+        elif msg_payload == b'stop':
+            if 'stop_value' not in cfg:
+                print("Missing stop_value for IR blind: " + adr)
+                return None
+            data = cfg['stop_value']
         else:
-            continue
-
-        if dtype != cfg.get('type') or adr != cadr:
-            continue
-        if isinstance(config['mediola'], list):
-            if cfg.get('mediola') != mediolaid:
-                continue
-
-        if dtype == 'IR':
-            if msg.payload in (b'open', b'up', b'on'):
-                if 'open_value' not in cfg:
-                    print("Missing open_value for IR blind: " + adr)
-                    return
-                data = cfg['open_value']
-            elif msg.payload in (b'close', b'down', b'off'):
-                if 'close_value' not in cfg:
-                    print("Missing close_value for IR blind: " + adr)
-                    return
-                data = cfg['close_value']
-            elif msg.payload == b'stop':
-                if 'stop_value' not in cfg:
-                    print("Missing stop_value for IR blind: " + adr)
-                    return
-                data = cfg['stop_value']
-            else:
-                print("Wrong command for IR blind: " + str(msg.payload))
-                return
-            payload = {"XC_FNC": "Send2", "type": "CODE", "ir": "01", "code": data}
-        elif dtype == 'RT':
-            if msg.payload not in rt_opcodes:
-                print("Wrong command for RT blind: " + str(msg.payload))
-                return
-            data = rt_opcodes[msg.payload] + adr
-            payload = {"XC_FNC": "SendSC", "type": dtype, "data": data}
-        elif dtype == 'ER':
-            try:
-                adr_hex = format(int(adr), "02x")
-            except (ValueError, TypeError):
-                print(f"Invalid ER address: {adr}")
-                return
-            if msg.payload in er_opcodes:
-                data = adr_hex + er_opcodes[msg.payload]
-            elif spayload.isnumeric():
-                # tilt - encoded as double-tap up/down
-                data = adr_hex + ("0A" if int(spayload) > 0 else "0B")
-            else:
-                print("Wrong command: " + str(msg.payload))
-                return
-            payload = {"XC_FNC": "SendSC", "type": dtype, "data": data}
+            print("Wrong command for IR blind: " + str(msg_payload))
+            return None
+        return {"XC_FNC": "Send2", "type": "CODE", "ir": "01", "code": data}
+    if dtype == 'RT':
+        if msg_payload not in rt_opcodes:
+            print("Wrong command for RT blind: " + str(msg_payload))
+            return None
+        return {"XC_FNC": "SendSC", "type": dtype,
+                "data": rt_opcodes[msg_payload] + adr}
+    if dtype == 'ER':
+        try:
+            adr_hex = format(int(adr), "02x")
+        except (ValueError, TypeError):
+            print(f"Invalid ER address: {adr}")
+            return None
+        if msg_payload in er_opcodes:
+            data = adr_hex + er_opcodes[msg_payload]
+        elif spayload.isnumeric():
+            # tilt - encoded as double-tap up/down
+            data = adr_hex + ("0A" if int(spayload) > 0 else "0B")
         else:
-            return
+            print("Wrong command: " + str(msg_payload))
+            return None
+        return {"XC_FNC": "SendSC", "type": dtype, "data": data}
+    return None
 
-        send_mediolaid = mediolaid
-        if isinstance(config['mediola'], list):
-            send_mediolaid = cfg.get('mediola', mediolaid)
-        if not _send_gateway_request(payload, send_mediolaid):
-            return
 
-        # Update position tracking for blinds with travel_time configured
-        travel_time = cfg.get('travel_time', 0)
-        if travel_time and blind_command in ('open', 'close', 'stop'):
-            identifier_key = get_blind_identifier(send_mediolaid, dtype, cadr)
-            topic_identifier = dtype + '_' + cadr
-            pos_topic = config['mqtt']['topic'] + '/blinds/' + send_mediolaid + '/' + topic_identifier + '/position'
-            current = get_current_blind_position(identifier_key)
-            _clear_movement_state(identifier_key, snapshot_pos=current)
+def _build_switch_payload(cfg, dtype, adr, msg_payload):
+    """Return the gateway payload for a switch command, or None on validation
+    failure. Logs the reason for failure."""
+    if dtype not in ('IT', 'IR'):
+        return None
 
-            if blind_command == 'stop':
-                _safe_publish(pos_topic, str(current), retain=True)
-            else:
-                final_pos = 100 if blind_command == 'open' else 0
-                if final_pos == current:
-                    _safe_publish(pos_topic, str(current), retain=True)
-                else:
-                    # Full open/close: gateway runs blind to physical stop, so
-                    # we don't send another 'stop' when the timer fires.
-                    _begin_movement(identifier_key, pos_topic, current,
-                                    final_pos, travel_time,
-                                    send_stop_at_end=False)
+    if msg_payload == b'ON':
+        value_key = 'on_value'
+        it_suffix = 'E'
+    elif msg_payload == b'OFF':
+        value_key = 'off_value'
+        it_suffix = '6'
+    else:
+        print("Wrong command")
+        return None
 
-        # Done dispatching to this blind; prevent duplicate entries from
-        # double-firing the gateway request.
+    if value_key in cfg:
+        data = cfg[value_key]
+    elif dtype == 'IT' and len(adr) == 3:
+        # Old family_code + device_code, A01 - P16. The address is supplied
+        # by the user / topic, so a malformed value must not crash the
+        # callback thread.
+        try:
+            device_code = int(adr[1:]) - 1
+        except ValueError:
+            print(f"Invalid IT address (non-numeric device code): {adr}")
+            return None
+        data = (format((ord(adr[0].upper()) - 65), 'X')
+                + format(device_code, 'X')
+                + it_suffix)
+    else:
+        print(f"Missing {value_key} and unknown type/address: {dtype}/{adr}")
+        return None
+
+    if dtype == 'IT':
+        return {"XC_FNC": "SendSC", "type": dtype, "data": data}
+    return {"XC_FNC": "Send2", "type": "CODE", "ir": "01", "code": data}
+
+
+def _handle_blind_command(category, mediolaid, dtype, adr, msg_payload, spayload):
+    cfg = _blind_command_index.get((mediolaid, dtype, adr))
+    if cfg is None:
+        print(f"No blind matches command: {mediolaid}/{dtype}/{adr}")
         return
 
-    for cfg in config.get('switches', []):
-        # currently only Intertechno and IR (= "other")
-        if dtype != 'IT' and dtype != 'IR':
-            continue
+    payload = _build_blind_payload(cfg, dtype, adr, msg_payload, spayload)
+    if payload is None:
+        return
 
-        # get address of configured switch
-        if 'adr' in cfg:
-            cadr = cfg['adr']
-        elif dtype == "IT" and 'on_value' in cfg:
-            cadr = get_IT_address(cfg['on_value'])
-        elif dtype == "IR" and 'name' in cfg:
-            cadr = get_IR_address(cfg['name'])
+    if not _send_gateway_request(payload, mediolaid):
+        # Gateway rejected the command — leave position state untouched so
+        # we don't desync from the physical blind.
+        return
+
+    if msg_payload in (b'open', b'up', b'on'):
+        blind_command = 'open'
+    elif msg_payload in (b'close', b'down', b'off'):
+        blind_command = 'close'
+    elif msg_payload == b'stop':
+        blind_command = 'stop'
+    else:
+        blind_command = None
+
+    travel_time = cfg.get('travel_time', 0)
+    if travel_time and blind_command in ('open', 'close', 'stop'):
+        identifier_key = get_blind_identifier(mediolaid, dtype, adr)
+        topic_identifier = dtype + '_' + adr
+        pos_topic = (config['mqtt']['topic'] + '/blinds/' + mediolaid
+                     + '/' + topic_identifier + '/position')
+        current = get_current_blind_position(identifier_key)
+        _clear_movement_state(identifier_key, snapshot_pos=current)
+
+        if blind_command == 'stop':
+            _safe_publish(pos_topic, str(current), retain=True)
         else:
-            continue
-
-        if dtype != cfg.get('type') or adr != cadr:
-            continue
-        if isinstance(config['mediola'], list):
-            if cfg.get('mediola') != mediolaid:
-                continue
-
-        if msg.payload == b'ON':
-            if 'on_value' in cfg:
-                data = cfg['on_value']
-            elif dtype == "IT" and len(adr) == 3:
-                # old family_code + device_code, A01 - P16
-                data = format((ord(adr[0].upper()) - 65), 'X') + format(int(adr[1:]) - 1, 'X') + 'E'
+            final_pos = 100 if blind_command == 'open' else 0
+            if final_pos == current:
+                _safe_publish(pos_topic, str(current), retain=True)
             else:
-                print("Missing on_value and unknown type/address: " + dtype + "/" + adr)
-                return
-        elif msg.payload == b'OFF':
-            if 'off_value' in cfg:
-                data = cfg['off_value']
-            elif dtype == "IT" and len(adr) == 3:
-                data = format((ord(adr[0].upper()) - 65), 'X') + format(int(adr[1:]) - 1, 'X') + '6'
-            else:
-                print("Missing off_value and unknown type/address: " + dtype + "/" + adr)
-                return
-        else:
-            print("Wrong command")
+                # Full open/close: gateway runs blind to physical stop, so
+                # we don't send another 'stop' when the timer fires.
+                _begin_movement(identifier_key, pos_topic, current,
+                                final_pos, travel_time,
+                                send_stop_at_end=False)
+
+
+def _handle_switch_command(category, mediolaid, dtype, adr, msg_payload):
+    cfg = _switch_command_index.get((mediolaid, dtype, adr))
+    if cfg is None:
+        print(f"No switch matches command: {mediolaid}/{dtype}/{adr}")
+        return
+
+    payload = _build_switch_payload(cfg, dtype, adr, msg_payload)
+    if payload is None:
+        return
+
+    if not _send_gateway_request(payload, mediolaid):
+        # Switches publish optimistically; just log the failure.
+        print(f"Gateway rejected switch command: {mediolaid}/{dtype}/{adr}")
+
+
+def on_message(client, obj, msg):
+    spayload = msg.payload.decode(errors='replace')
+    print("Msg: " + msg.topic + " " + str(msg.qos) + " " + str(msg.payload))
+
+    parsed = _parse_command_topic(msg.topic)
+    if parsed is None:
+        print(f"Ignoring unrecognized topic: {msg.topic}")
+        return
+    category, mediolaid, dtype, adr, is_position = parsed
+
+    if is_position:
+        if category != 'blinds':
+            print(f"Ignoring position command for non-blind category: "
+                  f"{category} ({msg.topic})")
             return
+        handle_blind_position(dtype, adr, mediolaid, spayload)
+        return
 
-        if dtype == 'IT':
-            payload = {"XC_FNC": "SendSC", "type": dtype, "data": data}
-        else:  # IR
-            payload = {"XC_FNC": "Send2", "type": "CODE", "ir": "01", "code": data}
-
-        send_mediolaid = mediolaid
-        if isinstance(config['mediola'], list):
-            send_mediolaid = cfg.get('mediola', mediolaid)
-        _send_gateway_request(payload, send_mediolaid)
-        # we are done here, end message processing
+    if category == 'blinds':
+        _handle_blind_command(category, mediolaid, dtype, adr,
+                              msg.payload, spayload)
+    elif category == 'switches':
+        _handle_switch_command(category, mediolaid, dtype, adr, msg.payload)
+    else:
+        print(f"Ignoring command with unknown category: "
+              f"{category} ({msg.topic})")
         return
 
 
@@ -753,90 +770,78 @@ def setup_discovery():
 
 
 def handle_button(packet_type, address, state, mediolaid):
-    retain = False
-    topic = False
-    payload = False
-
-    for cfg in config.get('buttons', []):
-        cfg_adr = cfg.get('adr')
-        cfg_type = cfg.get('type')
-        if cfg_adr is None or cfg_type is None:
-            continue
-        if packet_type != cfg_type:
-            continue
-        if address != cfg_adr.lower():
-            continue
-        if isinstance(config['mediola'], list):
-            if cfg.get('mediola') != mediolaid:
-                continue
-        identifier = cfg_type + '_' + cfg_adr
-        topic = config['mqtt']['topic'] + '/buttons/' + mediolaid + '/' + identifier
-        payload = state
-    return topic, payload, retain
+    cfg = _button_index.get((mediolaid, packet_type, address))
+    if cfg is None:
+        return False, False, False
+    cfg_adr = cfg['adr']
+    cfg_type = cfg['type']
+    identifier = cfg_type + '_' + cfg_adr
+    topic = (config['mqtt']['topic'] + '/buttons/' + mediolaid + '/'
+             + identifier)
+    return topic, state, False
 
 
 def handle_blind(packet_type, address, state, mediolaid):
-    retain = True
-    topic = False
-    payload = False
-
-    for cfg in config.get('blinds', []):
-        blind_type = cfg.get('type')
-        if blind_type is None:
-            continue
-        # ER status packets target ER blinds, R2 status packets target RT blinds
-        packet_matches_blind = (
-            (packet_type == 'ER' and blind_type == 'ER') or
-            (packet_type == 'R2' and blind_type == 'RT')
-        )
-        if not packet_matches_blind:
-            continue
-        cfg_adr = cfg.get('adr')
-        if cfg_adr is None and blind_type == 'IR' and 'name' in cfg:
-            cfg_adr = get_IR_address(cfg['name'])
-        if cfg_adr is None:
-            continue
-        if address != cfg_adr.lower():
-            continue
-        if isinstance(config['mediola'], list):
-            if cfg.get('mediola') != mediolaid:
-                continue
-        identifier = blind_type + '_' + cfg_adr
-        topic = config['mqtt']['topic'] + '/blinds/' + mediolaid + '/' + identifier + '/state'
-        payload = 'unknown'
-        if packet_type == 'ER':
-            if state in ('01', '0e'):
-                payload = 'open'
-            elif state in ('02', '0f'):
-                payload = 'closed'
-            elif state in ('08', '0a'):
-                payload = 'opening'
-            elif state in ('09', '0b'):
-                payload = 'closing'
-            elif state in ('0d', '05'):
-                payload = 'stopped'
-        elif packet_type == 'R2':
-            # For RT/R2 many gateways report coarse state values only.
-            # 00:00 is commonly idle/stopped.
-            if state in ('00:00', '00'):
-                payload = 'stopped'
-    return topic, payload, retain
+    cfg = _blind_status_index.get((mediolaid, packet_type, address))
+    if cfg is None:
+        return False, False, True
+    blind_type = cfg.get('type')
+    cfg_adr = _resolve_blind_address(cfg)
+    if cfg_adr is None:
+        return False, False, True
+    identifier = blind_type + '_' + cfg_adr
+    topic = (config['mqtt']['topic'] + '/blinds/' + mediolaid + '/'
+             + identifier + '/state')
+    payload = 'unknown'
+    if packet_type == 'ER':
+        if state in ('01', '0e'):
+            payload = 'open'
+        elif state in ('02', '0f'):
+            payload = 'closed'
+        elif state in ('08', '0a'):
+            payload = 'opening'
+        elif state in ('09', '0b'):
+            payload = 'closing'
+        elif state in ('0d', '05'):
+            payload = 'stopped'
+    elif packet_type == 'R2':
+        # For RT/R2 many gateways report coarse state values only.
+        # 00:00 is commonly idle/stopped.
+        if state in ('00:00', '00'):
+            payload = 'stopped'
+    return topic, payload, True
 
 
-_mediola_host_ip_cache = {}
+# DNS cache TTL in seconds. A bounded TTL avoids serving stale host->IP
+# mappings indefinitely after DHCP renewals or gateway failover.
+DNS_CACHE_TTL = 300
+
+_mediola_host_ip_cache = {}  # host -> (ipaddr, monotonic_timestamp)
+_mediola_host_ip_cache_lock = threading.Lock()
 
 
-def _resolve_host_ip(host):
-    """Cached gethostbyname so we don't hit DNS for every UDP packet."""
-    cached = _mediola_host_ip_cache.get(host)
-    if cached is not None:
-        return cached
+def _resolve_host_ip(host, force_refresh=False):
+    """Cached gethostbyname so we don't hit DNS for every UDP packet.
+
+    Entries expire after DNS_CACHE_TTL seconds. Pass force_refresh=True
+    to bypass the cache (e.g. after a connection failure).
+    """
+    now = time.monotonic()
+    if not force_refresh:
+        with _mediola_host_ip_cache_lock:
+            entry = _mediola_host_ip_cache.get(host)
+            if entry is not None and (now - entry[1]) < DNS_CACHE_TTL:
+                return entry[0]
     try:
         ipaddr = socket.gethostbyname(host)
     except socket.gaierror as err:
         print(f"DNS lookup failed for {host}: {err}")
+        # Drop the stale entry on failure so the next call re-resolves.
+        with _mediola_host_ip_cache_lock:
+            _mediola_host_ip_cache.pop(host, None)
         return None
-    _mediola_host_ip_cache[host] = ipaddr
+    with _mediola_host_ip_cache_lock:
+        _mediola_host_ip_cache[host] = (ipaddr, now)
     return ipaddr
 
 
@@ -844,11 +849,20 @@ def get_mediolaid_by_address(addr):
     if not isinstance(config['mediola'], list):
         return 'mediola'
     src_ip = addr[0]
+    # First pass uses the cache. If no cached IP matches, refresh once and
+    # try again so a renewed DHCP lease doesn't strand us forever.
     for entry in config['mediola']:
         host = entry.get('host')
         if not host:
             continue
         ipaddr = _resolve_host_ip(host)
+        if ipaddr is not None and src_ip == ipaddr:
+            return entry.get('id', 'mediola')
+    for entry in config['mediola']:
+        host = entry.get('host')
+        if not host:
+            continue
+        ipaddr = _resolve_host_ip(host, force_refresh=True)
         if ipaddr is not None and src_ip == ipaddr:
             return entry.get('id', 'mediola')
     return 'mediola'
@@ -946,92 +960,166 @@ def get_IR_address(name):
     return adr
 
 
+def _config_mediola_id_for(cfg):
+    """Return the mediola id this config entry belongs to, or None."""
+    if isinstance(config['mediola'], list):
+        return cfg.get('mediola')
+    return 'mediola'
+
+
+def _build_indexes():
+    """Index device configs for O(1) dispatch.
+
+    Called at startup (and whenever the config changes) so that incoming
+    MQTT messages and UDP status packets can find their matching cfg entry
+    without scanning the full config every time.
+    """
+    _blind_command_index.clear()
+    _blind_status_index.clear()
+    _switch_command_index.clear()
+    _button_index.clear()
+
+    for cfg in config.get('blinds', []):
+        btype = cfg.get('type')
+        if not btype:
+            continue
+        cadr = _resolve_blind_address(cfg)
+        if cadr is None:
+            continue
+        mid = _config_mediola_id_for(cfg)
+        if mid is None:
+            continue
+        _blind_command_index.setdefault((mid, btype, cadr), cfg)
+        # Status packets: ER blinds receive ER packets, RT blinds receive R2.
+        if btype == 'ER':
+            _blind_status_index.setdefault((mid, 'ER', cadr.lower()), cfg)
+        elif btype == 'RT':
+            _blind_status_index.setdefault((mid, 'R2', cadr.lower()), cfg)
+
+    for cfg in config.get('switches', []):
+        stype = cfg.get('type')
+        if not stype:
+            continue
+        cadr = _resolve_switch_address(cfg)
+        if cadr is None:
+            continue
+        mid = _config_mediola_id_for(cfg)
+        if mid is None:
+            continue
+        _switch_command_index.setdefault((mid, stype, cadr), cfg)
+
+    for cfg in config.get('buttons', []):
+        ctype = cfg.get('type')
+        cadr = cfg.get('adr')
+        if not ctype or cadr is None:
+            continue
+        mid = _config_mediola_id_for(cfg)
+        if mid is None:
+            continue
+        _button_index.setdefault((mid, ctype, cadr.lower()), cfg)
+
+
+# Build dispatch indexes once the config is fully loaded so that helper
+# functions (including those triggered by tests that import the module
+# without running main()) can rely on them being populated.
+_build_indexes()
+
+
 def _shutdown_handler(signum, frame):
     print(f'Received signal {signum}, shutting down.')
     _shutdown_event.set()
 
 
-# Setup MQTT connection
-mqttc = mqtt.Client()
+def main():
+    """Set up MQTT and run the UDP listen loop. Runs until shutdown."""
+    global mqttc
 
-mqttc.on_connect = on_connect
-mqttc.on_subscribe = on_subscribe
-mqttc.on_disconnect = on_disconnect
-mqttc.on_message = on_message
+    # Rebuild indexes in case the config was reloaded between import and run.
+    _build_indexes()
 
-if config['mqtt'].get('debug'):
-    print("Debugging messages enabled")
-    mqttc.on_log = on_log
-    mqttc.on_publish = on_publish
+    mqttc = mqtt.Client()
+    mqttc.on_connect = on_connect
+    mqttc.on_subscribe = on_subscribe
+    mqttc.on_disconnect = on_disconnect
+    mqttc.on_message = on_message
 
-if config['mqtt'].get('username') and config['mqtt'].get('password'):
-    mqttc.username_pw_set(config['mqtt']['username'], config['mqtt']['password'])
-try:
-    mqttc.connect(config['mqtt']['host'], config['mqtt']['port'], 60)
-except (OSError, ConnectionError) as err:
-    print(f'Error connecting to MQTT ({err}), will now quit.')
-    sys.exit(1)
-mqttc.loop_start()
+    if config['mqtt'].get('debug'):
+        print("Debugging messages enabled")
+        mqttc.on_log = on_log
+        mqttc.on_publish = on_publish
 
-listen_port = 1902
-if 'general' in config:
-    if 'port' in config['general']:
+    if config['mqtt'].get('username') and config['mqtt'].get('password'):
+        mqttc.username_pw_set(config['mqtt']['username'],
+                              config['mqtt']['password'])
+    try:
+        mqttc.connect(config['mqtt']['host'], config['mqtt']['port'], 60)
+    except (OSError, ConnectionError) as err:
+        print(f'Error connecting to MQTT ({err}), will now quit.')
+        sys.exit(1)
+    mqttc.loop_start()
+
+    listen_port = 1902
+    if 'general' in config and 'port' in config['general']:
         listen_port = config['general']['port']
 
-sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-sock.bind(('', listen_port))
-sock.settimeout(1.0)
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    sock.bind(('', listen_port))
+    sock.settimeout(1.0)
 
-# Install signal handlers so SIGTERM (systemd, Docker stop) runs cleanup.
-try:
-    signal.signal(signal.SIGTERM, _shutdown_handler)
-    signal.signal(signal.SIGINT, _shutdown_handler)
-except ValueError:
-    # signal.signal only works in the main thread; guard for embedded use.
-    pass
+    # Install signal handlers so SIGTERM (systemd, Docker stop) runs cleanup.
+    try:
+        signal.signal(signal.SIGTERM, _shutdown_handler)
+        signal.signal(signal.SIGINT, _shutdown_handler)
+    except ValueError:
+        # signal.signal only works in the main thread; guard for embedded use.
+        pass
 
-try:
-    while not _shutdown_event.is_set():
+    try:
+        while not _shutdown_event.is_set():
+            try:
+                data, addr = sock.recvfrom(UDP_BUF_SIZE)
+            except socket.timeout:
+                continue
+            except OSError as err:
+                print(f"Socket error: {err}")
+                break
+
+            if config['mqtt'].get('debug'):
+                print('Received message: %s' % data)
+            _safe_publish(config['mqtt']['topic'], data, retain=False)
+
+            # For the v4 (and probably v5) gateways, the status packet starts
+            # with '{XC_EVT}', but for the v6 it starts with 'STA:'.
+            if data.startswith(b'{XC_EVT}'):
+                data = data.replace(b'{XC_EVT}', b'')
+                if not handle_packet_v4(data, addr):
+                    if config['mqtt'].get('debug'):
+                        print('Error handling v4 packet: %s' % data)
+            elif data.startswith(b'STA:'):
+                data = data.replace(b'STA:', b'')
+                if not handle_packet_v6(data, addr):
+                    if config['mqtt'].get('debug'):
+                        print('Error handling v6 packet: %s' % data)
+    finally:
+        print('Shutting down.')
+        with blind_state_lock:
+            for t in list(blind_timers.values()):
+                t.cancel()
+            for t in list(blind_progress_timers.values()):
+                t.cancel()
+            blind_timers.clear()
+            blind_progress_timers.clear()
+            blind_movements.clear()
         try:
-            data, addr = sock.recvfrom(UDP_BUF_SIZE)
-        except socket.timeout:
-            continue
-        except OSError as err:
-            print(f"Socket error: {err}")
-            break
+            sock.close()
+        except OSError:
+            pass
+        mqttc.loop_stop()
+        try:
+            mqttc.disconnect()
+        except Exception:
+            pass
 
-        if config['mqtt'].get('debug'):
-            print('Received message: %s' % data)
-        _safe_publish(config['mqtt']['topic'], data, retain=False)
 
-        # For the v4 (and probably v5) gateways, the status packet starts
-        # with '{XC_EVT}', but for the v6 it starts with 'STA:'.
-        if data.startswith(b'{XC_EVT}'):
-            data = data.replace(b'{XC_EVT}', b'')
-            if not handle_packet_v4(data, addr):
-                if config['mqtt'].get('debug'):
-                    print('Error handling v4 packet: %s' % data)
-        elif data.startswith(b'STA:'):
-            data = data.replace(b'STA:', b'')
-            if not handle_packet_v6(data, addr):
-                if config['mqtt'].get('debug'):
-                    print('Error handling v6 packet: %s' % data)
-finally:
-    print('Shutting down.')
-    with blind_state_lock:
-        for t in list(blind_timers.values()):
-            t.cancel()
-        for t in list(blind_progress_timers.values()):
-            t.cancel()
-        blind_timers.clear()
-        blind_progress_timers.clear()
-        blind_movements.clear()
-    try:
-        sock.close()
-    except OSError:
-        pass
-    mqttc.loop_stop()
-    try:
-        mqttc.disconnect()
-    except Exception:
-        pass
+if __name__ == '__main__':
+    main()
