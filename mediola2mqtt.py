@@ -14,6 +14,7 @@ import requests
 import threading
 import time
 import itertools
+import queue
 import signal
 
 # Module logger. A NullHandler keeps tests / library imports silent until the
@@ -65,6 +66,19 @@ _movement_gen = itertools.count(1)
 
 # Coordinated shutdown flag for the main UDP loop.
 _shutdown_event = threading.Event()
+
+# Command worker: gateway HTTP requests run on this dedicated thread so a
+# slow/hung gateway can't stall the MQTT network thread (which would delay
+# keepalives and every other message). The queue is bounded so a dead
+# gateway doesn't buffer commands without limit. When the worker isn't
+# running (tests, library use), commands execute inline.
+_COMMAND_QUEUE_MAX = 100
+_command_queue = queue.Queue(maxsize=_COMMAND_QUEUE_MAX)
+_command_worker_started = threading.Event()
+
+# Source IPs we already warned about when dropping unauthenticated UDP
+# packets; bounded so an address-spoofing flood can't grow memory.
+_unknown_source_logged = set()
 
 # Lookup indexes for O(1) device dispatch. Built by _build_indexes() after
 # the config has been loaded. Keys are tuples: (mediolaid, dtype, adr)
@@ -169,8 +183,36 @@ def _safe_publish(topic, payload, retain=False):
     """Wrap mqttc.publish to avoid losing the worker thread on transient errors."""
     try:
         mqttc.publish(topic, payload=payload, retain=retain)
-    except Exception as err:
-        print(f"Error publishing to {topic}: {err}")
+    except Exception:
+        logger.exception("Error publishing to %s", topic)
+
+
+def _dispatch_command(func, *args):
+    """Run a command handler on the worker thread (inline if not running)."""
+    if not _command_worker_started.is_set():
+        func(*args)
+        return
+    try:
+        _command_queue.put_nowait((func, args))
+    except queue.Full:
+        logger.error("Command queue full (%d pending); dropping command",
+                     _COMMAND_QUEUE_MAX)
+
+
+def _command_worker():
+    """Drain the command queue until a None sentinel arrives."""
+    while True:
+        item = _command_queue.get()
+        try:
+            if item is None:
+                return
+            func, args = item
+            try:
+                func(*args)
+            except Exception:
+                logger.exception("Error executing queued command")
+        finally:
+            _command_queue.task_done()
 
 
 def start_blind_progress_updates(identifier, pos_topic, gen):
@@ -210,7 +252,7 @@ def send_blind_command(blind_cfg, adr, command, mediolaid):
     if dtype == 'IR':
         key = command + '_value'
         if key not in blind_cfg:
-            print(f"Missing {key} for IR blind: {adr}")
+            logger.warning("Missing %s for IR blind: %s", key, adr)
             return False
         payload = {"XC_FNC": "Send2", "type": "CODE", "ir": "01", "code": blind_cfg[key]}
     elif dtype == 'RT':
@@ -225,7 +267,7 @@ def send_blind_command(blind_cfg, adr, command, mediolaid):
         try:
             adr_hex = format(int(adr), "02x")
         except (ValueError, TypeError):
-            print(f"Invalid ER address: {adr}")
+            logger.warning("Invalid ER address: %s", adr)
             return False
         payload = {"XC_FNC": "SendSC", "type": "ER", "data": adr_hex + suffix}
     else:
@@ -254,10 +296,15 @@ def _clear_movement_state(identifier, snapshot_pos=None):
 
 
 def _begin_movement(identifier, pos_topic, current, target, travel_time,
-                    send_stop_at_end, blind_cfg=None, adr=None, mediolaid=None):
+                    send_stop_at_end, blind_cfg=None, adr=None, mediolaid=None,
+                    start_time=None):
     """Register movement state, kick off progress updates, and schedule the
     finish timer. Caller must have already cleared previous state and (where
     appropriate) sent the gateway command that physically starts the blind.
+
+    `start_time` (time.monotonic) marks when the gateway command was sent;
+    the blind started moving then, not when the HTTP response arrived, so the
+    finish timer is shortened by the elapsed difference.
     """
     if target == current:
         return None
@@ -265,10 +312,14 @@ def _begin_movement(identifier, pos_topic, current, target, travel_time,
     if duration <= 0:
         return None
 
+    now = time.monotonic()
+    if start_time is None:
+        start_time = now
+
     gen = next(_movement_gen)
     with blind_state_lock:
         blind_movements[identifier] = {
-            'start_time': time.monotonic(),
+            'start_time': start_time,
             'start_pos': current,
             'target_pos': target,
             'travel_time': travel_time,
@@ -294,7 +345,8 @@ def _begin_movement(identifier, pos_topic, current, target, travel_time,
             send_blind_command(bcfg, c, 'stop', m)
         _safe_publish(pt, str(fp), retain=True)
 
-    t = threading.Timer(duration, _finish)
+    remaining = max(0.0, duration - (now - start_time))
+    t = threading.Timer(remaining, _finish)
     with blind_state_lock:
         blind_timers[identifier] = t
     t.start()
@@ -304,10 +356,11 @@ def _begin_movement(identifier, pos_topic, current, target, travel_time,
 def handle_blind_position(dtype, adr, mediolaid, spayload):
     """Handle a set_position command (0-100) using travel_time-based timing."""
     try:
+        # OverflowError: int(float('inf')); ValueError also covers nan.
         target = int(float(spayload))
         target = max(0, min(100, target))
-    except (ValueError, TypeError):
-        print(f"Invalid position value: {spayload}")
+    except (ValueError, TypeError, OverflowError):
+        logger.warning("Invalid position value: %r", spayload)
         return
 
     cfg = _blind_command_index.get((mediolaid, dtype, adr))
@@ -316,13 +369,14 @@ def handle_blind_position(dtype, adr, mediolaid, spayload):
 
     travel_time = cfg.get('travel_time', 0)
     if not travel_time:
-        print(f"No travel_time configured for blind: {adr}")
+        logger.warning("No travel_time configured for blind: %s", adr)
         return
 
     # IR blinds without stop_value cannot honor an intermediate target;
     # the timed movement would never be terminated.
     if cfg.get('type') == 'IR' and 'stop_value' not in cfg:
-        print(f"Cannot set position for IR blind without stop_value: {adr}")
+        logger.warning(
+            "Cannot set position for IR blind without stop_value: %s", adr)
         return
 
     identifier = get_blind_identifier(mediolaid, dtype, adr)
@@ -344,11 +398,12 @@ def handle_blind_position(dtype, adr, mediolaid, spayload):
 
     _clear_movement_state(identifier, snapshot_pos=current)
     direction = 'open' if target > current else 'close'
+    command_sent_at = time.monotonic()
     if not send_blind_command(cfg, adr, direction, mediolaid):
         return
     _begin_movement(identifier, pos_topic, current, target, travel_time,
                     send_stop_at_end=True, blind_cfg=cfg, adr=adr,
-                    mediolaid=mediolaid)
+                    mediolaid=mediolaid, start_time=command_sent_at)
 
 
 # Define MQTT event callbacks
@@ -362,16 +417,22 @@ def on_connect(client, userdata, flags, rc):
         5: "not authorised"
     }
     if rc != 0:
-        print("MQTT: " + connect_statuses.get(rc, "Unknown error"))
+        logger.error("MQTT: %s", connect_statuses.get(rc, "Unknown error"))
     else:
-        setup_discovery()
+        logger.info("MQTT connected")
+        # An exception here would kill the paho network thread, leaving the
+        # process alive but deaf. Log and carry on with a degraded setup.
+        try:
+            setup_discovery()
+        except Exception:
+            logger.exception("Error during discovery setup")
 
 
 def on_disconnect(client, userdata, rc):
     if rc != 0:
-        print("Unexpected disconnection")
+        logger.warning("Unexpected MQTT disconnection (rc=%s)", rc)
     else:
-        print("Disconnected")
+        logger.info("MQTT disconnected")
 
 
 def _parse_command_topic(topic):
@@ -408,6 +469,50 @@ def _parse_command_topic(topic):
     return category, mediolaid, dtype, adr, is_position
 
 
+def _parse_position_state_topic(topic):
+    """Parse a retained position-state topic into (category, mediolaid,
+    dtype, adr), or None. Shape: <base>/<category>/<mediolaid>/<dtype>_<adr>/position
+    """
+    parts = topic.split('/')
+    if len(parts) < 5 or parts[-1] != 'position':
+        return None
+    category = parts[-4]
+    mediolaid = parts[-3]
+    device_segment = parts[-2]
+    if not category or '_' not in device_segment:
+        return None
+    dtype, _, adr = device_segment.partition('_')
+    if not dtype or not adr:
+        return None
+    return category, mediolaid, dtype, adr
+
+
+def _seed_blind_position(mediolaid, dtype, adr, spayload):
+    """Adopt a retained position (published before a restart) as the baseline.
+
+    Positions otherwise live only in memory and default to 100 after a
+    restart, which makes the first timed movement run from a wrong starting
+    point. Live state always wins: once a position or movement exists for
+    the identifier, retained echoes of our own publishes are ignored.
+    """
+    if _blind_command_index.get((mediolaid, dtype, adr)) is None:
+        return
+    try:
+        pos = int(float(spayload))
+    except (ValueError, TypeError, OverflowError):
+        logger.warning("Ignoring invalid retained position %r for %s_%s_%s",
+                       spayload, mediolaid, dtype, adr)
+        return
+    pos = max(0, min(100, pos))
+    identifier = get_blind_identifier(mediolaid, dtype, adr)
+    with blind_state_lock:
+        if identifier in blind_positions or identifier in blind_movements:
+            return
+        blind_positions[identifier] = pos
+    logger.info("Restored blind position %s=%d from retained MQTT state",
+                identifier, pos)
+
+
 def _build_blind_payload(cfg, dtype, adr, msg_payload, spayload):
     """Return the gateway payload for a blind command, or None on validation
     failure. Logs the reason for failure."""
@@ -431,26 +536,26 @@ def _build_blind_payload(cfg, dtype, adr, msg_payload, spayload):
     if dtype == 'IR':
         if msg_payload in (b'open', b'up', b'on'):
             if 'open_value' not in cfg:
-                print("Missing open_value for IR blind: " + adr)
+                logger.warning("Missing open_value for IR blind: %s", adr)
                 return None
             data = cfg['open_value']
         elif msg_payload in (b'close', b'down', b'off'):
             if 'close_value' not in cfg:
-                print("Missing close_value for IR blind: " + adr)
+                logger.warning("Missing close_value for IR blind: %s", adr)
                 return None
             data = cfg['close_value']
         elif msg_payload == b'stop':
             if 'stop_value' not in cfg:
-                print("Missing stop_value for IR blind: " + adr)
+                logger.warning("Missing stop_value for IR blind: %s", adr)
                 return None
             data = cfg['stop_value']
         else:
-            print("Wrong command for IR blind: " + str(msg_payload))
+            logger.warning("Wrong command for IR blind: %r", msg_payload)
             return None
         return {"XC_FNC": "Send2", "type": "CODE", "ir": "01", "code": data}
     if dtype == 'RT':
         if msg_payload not in rt_opcodes:
-            print("Wrong command for RT blind: " + str(msg_payload))
+            logger.warning("Wrong command for RT blind: %r", msg_payload)
             return None
         return {"XC_FNC": "SendSC", "type": dtype,
                 "data": rt_opcodes[msg_payload] + adr}
@@ -458,16 +563,20 @@ def _build_blind_payload(cfg, dtype, adr, msg_payload, spayload):
         try:
             adr_hex = format(int(adr), "02x")
         except (ValueError, TypeError):
-            print(f"Invalid ER address: {adr}")
+            logger.warning("Invalid ER address: %s", adr)
             return None
         if msg_payload in er_opcodes:
             data = adr_hex + er_opcodes[msg_payload]
-        elif spayload.isnumeric():
-            # tilt - encoded as double-tap up/down
-            data = adr_hex + ("0A" if int(spayload) > 0 else "0B")
         else:
-            print("Wrong command: " + str(msg_payload))
-            return None
+            # tilt - encoded as double-tap up/down. Note: str.isnumeric()
+            # accepts Unicode numerics that int() rejects (e.g. '⅓'), so
+            # the conversion itself is the only reliable validation.
+            try:
+                tilt = int(spayload)
+            except (ValueError, TypeError):
+                logger.warning("Wrong command for ER blind: %r", msg_payload)
+                return None
+            data = adr_hex + ("0A" if tilt > 0 else "0B")
         return {"XC_FNC": "SendSC", "type": dtype, "data": data}
     return None
 
@@ -485,7 +594,8 @@ def _build_switch_payload(cfg, dtype, adr, msg_payload):
         value_key = 'off_value'
         it_suffix = '6'
     else:
-        print("Wrong command")
+        logger.warning("Wrong command for switch %s/%s: %r",
+                       dtype, adr, msg_payload)
         return None
 
     if value_key in cfg:
@@ -493,18 +603,28 @@ def _build_switch_payload(cfg, dtype, adr, msg_payload):
     elif dtype == 'IT' and len(adr) == 3:
         # Old family_code + device_code, A01 - P16. The address is supplied
         # by the user / topic, so a malformed value must not crash the
-        # callback thread.
+        # callback thread or encode garbage nibbles for the gateway.
+        family = adr[0].upper()
+        if not 'A' <= family <= 'P':
+            logger.warning(
+                "Invalid IT address (family code must be A-P): %r", adr)
+            return None
         try:
             device_code = int(adr[1:]) - 1
         except ValueError:
             logger.warning(
                 "Invalid IT address (non-numeric device code): %r", adr)
             return None
-        data = (format((ord(adr[0].upper()) - 65), 'X')
+        if not 0 <= device_code <= 15:
+            logger.warning(
+                "Invalid IT address (device code must be 01-16): %r", adr)
+            return None
+        data = (format((ord(family) - 65), 'X')
                 + format(device_code, 'X')
                 + it_suffix)
     else:
-        print(f"Missing {value_key} and unknown type/address: {dtype}/{adr}")
+        logger.warning("Missing %s and unknown type/address: %s/%s",
+                       value_key, dtype, adr)
         return None
 
     if dtype == 'IT':
@@ -515,13 +635,15 @@ def _build_switch_payload(cfg, dtype, adr, msg_payload):
 def _handle_blind_command(category, mediolaid, dtype, adr, msg_payload, spayload):
     cfg = _blind_command_index.get((mediolaid, dtype, adr))
     if cfg is None:
-        print(f"No blind matches command: {mediolaid}/{dtype}/{adr}")
+        logger.warning("No blind matches command: %s/%s/%s",
+                       mediolaid, dtype, adr)
         return
 
     payload = _build_blind_payload(cfg, dtype, adr, msg_payload, spayload)
     if payload is None:
         return
 
+    command_sent_at = time.monotonic()
     if not _send_gateway_request(payload, mediolaid):
         # Gateway rejected the command — leave position state untouched so
         # we don't desync from the physical blind.
@@ -556,13 +678,15 @@ def _handle_blind_command(category, mediolaid, dtype, adr, msg_payload, spayload
                 # we don't send another 'stop' when the timer fires.
                 _begin_movement(identifier_key, pos_topic, current,
                                 final_pos, travel_time,
-                                send_stop_at_end=False)
+                                send_stop_at_end=False,
+                                start_time=command_sent_at)
 
 
 def _handle_switch_command(category, mediolaid, dtype, adr, msg_payload):
     cfg = _switch_command_index.get((mediolaid, dtype, adr))
     if cfg is None:
-        print(f"No switch matches command: {mediolaid}/{dtype}/{adr}")
+        logger.warning("No switch matches command: %s/%s/%s",
+                       mediolaid, dtype, adr)
         return
 
     payload = _build_switch_payload(cfg, dtype, adr, msg_payload)
@@ -571,48 +695,70 @@ def _handle_switch_command(category, mediolaid, dtype, adr, msg_payload):
 
     if not _send_gateway_request(payload, mediolaid):
         # Switches publish optimistically; just log the failure.
-        print(f"Gateway rejected switch command: {mediolaid}/{dtype}/{adr}")
+        logger.warning("Gateway rejected switch command: %s/%s/%s",
+                       mediolaid, dtype, adr)
 
 
 def on_message(client, obj, msg):
+    # paho re-raises callback exceptions into its network thread by default,
+    # which would silently kill the MQTT loop. Nothing a single message does
+    # may take the bridge down.
+    try:
+        _on_message_impl(client, obj, msg)
+    except Exception:
+        logger.exception("Unhandled error processing message on %s",
+                         msg.topic)
+
+
+def _on_message_impl(client, obj, msg):
     spayload = msg.payload.decode(errors='replace')
-    print("Msg: " + msg.topic + " " + str(msg.qos) + " " + str(msg.payload))
+    logger.debug("Msg: %s %s %r", msg.topic, msg.qos, msg.payload)
+
+    # Retained position state (own publishes / pre-restart values).
+    parsed_state = _parse_position_state_topic(msg.topic)
+    if parsed_state is not None:
+        category, mediolaid, dtype, adr = parsed_state
+        if category == 'blinds':
+            _seed_blind_position(mediolaid, dtype, adr, spayload)
+        return
 
     parsed = _parse_command_topic(msg.topic)
     if parsed is None:
-        print(f"Ignoring unrecognized topic: {msg.topic}")
+        logger.debug("Ignoring unrecognized topic: %s", msg.topic)
         return
     category, mediolaid, dtype, adr, is_position = parsed
 
     if is_position:
         if category != 'blinds':
-            print(f"Ignoring position command for non-blind category: "
-                  f"{category} ({msg.topic})")
+            logger.warning("Ignoring position command for non-blind "
+                           "category: %s (%s)", category, msg.topic)
             return
-        handle_blind_position(dtype, adr, mediolaid, spayload)
+        _dispatch_command(handle_blind_position, dtype, adr, mediolaid,
+                          spayload)
         return
 
     if category == 'blinds':
-        _handle_blind_command(category, mediolaid, dtype, adr,
-                              msg.payload, spayload)
+        _dispatch_command(_handle_blind_command, category, mediolaid, dtype,
+                          adr, msg.payload, spayload)
     elif category == 'switches':
-        _handle_switch_command(category, mediolaid, dtype, adr, msg.payload)
+        _dispatch_command(_handle_switch_command, category, mediolaid, dtype,
+                          adr, msg.payload)
     else:
-        print(f"Ignoring command with unknown category: "
-              f"{category} ({msg.topic})")
+        logger.warning("Ignoring command with unknown category: %s (%s)",
+                       category, msg.topic)
         return
 
 
 def on_publish(client, obj, mid):
-    print("Pub: " + str(mid))
+    logger.debug("Pub: %s", mid)
 
 
 def on_subscribe(client, obj, mid, granted_qos):
-    print("Subscribed: " + str(mid) + " " + str(granted_qos))
+    logger.debug("Subscribed: %s %s", mid, granted_qos)
 
 
 def on_log(client, obj, level, string):
-    print(string)
+    logger.debug(string)
 
 
 def _resolve_mediolaid_and_host(item):
@@ -653,12 +799,13 @@ def setup_discovery():
         # Buttons are configured as MQTT device triggers
         for ii, cfg in enumerate(config['buttons']):
             if 'type' not in cfg or 'adr' not in cfg:
-                print(f"Skipping button[{ii}]: missing type or adr")
+                logger.warning("Skipping button[%d]: missing type or adr", ii)
                 continue
             identifier = cfg['type'] + '_' + cfg['adr']
             mediolaid, host = _resolve_mediolaid_and_host(cfg)
             if not host:
-                print('Error: Could not find matching Mediola!')
+                logger.error("Could not find matching Mediola for button[%d]",
+                             ii)
                 continue
             deviceid = "mediola_buttons_" + host.replace(".", "")
             dtopic = config['mqtt']['discovery_prefix'] + '/device_automation/' + \
@@ -681,16 +828,18 @@ def setup_discovery():
         for ii, cfg in enumerate(config['switches']):
             stype = cfg.get('type')
             if stype is None:
-                print(f"Skipping switch[{ii}]: missing type")
+                logger.warning("Skipping switch[%d]: missing type", ii)
                 continue
             adr = _resolve_switch_address(cfg)
             if adr is None:
-                print(f"Skipping switch[{ii}]: cannot determine address")
+                logger.warning("Skipping switch[%d]: cannot determine address",
+                               ii)
                 continue
             identifier = stype + '_' + adr
             mediolaid, host = _resolve_mediolaid_and_host(cfg)
             if not host:
-                print('Error: Could not find matching Mediola!')
+                logger.error("Could not find matching Mediola for switch[%d]",
+                             ii)
                 continue
             deviceid = "mediola_switches_" + host.replace(".", "")
             dtopic = config['mqtt']['discovery_prefix'] + '/switch/' + \
@@ -717,16 +866,18 @@ def setup_discovery():
         for ii, cfg in enumerate(config['blinds']):
             btype = cfg.get('type')
             if btype is None:
-                print(f"Skipping blind[{ii}]: missing type")
+                logger.warning("Skipping blind[%d]: missing type", ii)
                 continue
             adr = _resolve_blind_address(cfg)
             if adr is None:
-                print(f"Skipping blind[{ii}]: cannot determine address")
+                logger.warning("Skipping blind[%d]: cannot determine address",
+                               ii)
                 continue
             identifier = btype + '_' + adr
             mediolaid, host = _resolve_mediolaid_and_host(cfg)
             if not host:
-                print('Error: Could not find matching Mediola!')
+                logger.error("Could not find matching Mediola for blind[%d]",
+                             ii)
                 continue
             deviceid = "mediola_blinds_" + host.replace(".", "")
             dtopic = config['mqtt']['discovery_prefix'] + '/cover/' + \
@@ -773,14 +924,18 @@ def setup_discovery():
                             payload['tilt_command_topic'] = payload['command_topic']
                         break
                     if not template_found:
-                        print(f"Missing template: {template}")
+                        logger.warning("Missing template: %s", template)
                 else:
-                    print(f"Missing section 'templates' to resolve template: {template}")
+                    logger.warning("Missing section 'templates' to resolve "
+                                   "template: %s", template)
             if btype == 'ER' or btype == 'RT':
                 payload["state_topic"] = topic + "/state"
             mqttc.subscribe(topic + "/set")
             if 'set_position_topic' in payload:
                 mqttc.subscribe(topic + '/position/set')
+                # Also read back our own retained position so the estimated
+                # state survives restarts (see _seed_blind_position).
+                mqttc.subscribe(topic + '/position')
             _safe_publish(dtopic, json.dumps(payload), retain=True)
 
 
@@ -807,7 +962,7 @@ def handle_blind(packet_type, address, state, mediolaid):
     identifier = blind_type + '_' + cfg_adr
     topic = (config['mqtt']['topic'] + '/blinds/' + mediolaid + '/'
              + identifier + '/state')
-    payload = 'unknown'
+    payload = None
     if packet_type == 'ER':
         if state in ('01', '0e'):
             payload = 'open'
@@ -824,6 +979,11 @@ def handle_blind(packet_type, address, state, mediolaid):
         # 00:00 is commonly idle/stopped.
         if state in ('00:00', '00'):
             payload = 'stopped'
+    if payload is None:
+        # 'unknown' is not a valid HA cover state; don't publish it.
+        logger.debug("Unmapped %s blind state %r for %s",
+                     packet_type, state, identifier)
+        return False, False, True
     return topic, payload, True
 
 
@@ -831,7 +991,14 @@ def handle_blind(packet_type, address, state, mediolaid):
 # mappings indefinitely after DHCP renewals or gateway failover.
 DNS_CACHE_TTL = 300
 
+# Minimum seconds between forced re-resolutions of the same host. Unmatched
+# UDP packets trigger a forced refresh (to survive DHCP lease changes), and
+# without a cooldown a junk-packet flood would turn into a DNS query flood
+# that blocks the single UDP thread.
+DNS_FORCE_REFRESH_COOLDOWN = 30
+
 _mediola_host_ip_cache = {}  # host -> (ipaddr, monotonic_timestamp)
+_dns_force_refresh_last = {}  # host -> monotonic timestamp of last force
 _mediola_host_ip_cache_lock = threading.Lock()
 
 
@@ -839,10 +1006,18 @@ def _resolve_host_ip(host, force_refresh=False):
     """Cached gethostbyname so we don't hit DNS for every UDP packet.
 
     Entries expire after DNS_CACHE_TTL seconds. Pass force_refresh=True
-    to bypass the cache (e.g. after a connection failure).
+    to bypass the cache (e.g. after a connection failure); forced refreshes
+    are rate-limited to one per DNS_FORCE_REFRESH_COOLDOWN per host.
     """
     now = time.monotonic()
-    if not force_refresh:
+    if force_refresh:
+        with _mediola_host_ip_cache_lock:
+            last = _dns_force_refresh_last.get(host)
+            if last is not None and (now - last) < DNS_FORCE_REFRESH_COOLDOWN:
+                entry = _mediola_host_ip_cache.get(host)
+                return entry[0] if entry is not None else None
+            _dns_force_refresh_last[host] = now
+    else:
         with _mediola_host_ip_cache_lock:
             entry = _mediola_host_ip_cache.get(host)
             if entry is not None and (now - entry[1]) < DNS_CACHE_TTL:
@@ -850,7 +1025,7 @@ def _resolve_host_ip(host, force_refresh=False):
     try:
         ipaddr = socket.gethostbyname(host)
     except socket.gaierror as err:
-        print(f"DNS lookup failed for {host}: {err}")
+        logger.warning("DNS lookup failed for %s: %s", host, err)
         # Drop the stale entry on failure so the next call re-resolves.
         with _mediola_host_ip_cache_lock:
             _mediola_host_ip_cache.pop(host, None)
@@ -861,29 +1036,47 @@ def _resolve_host_ip(host, force_refresh=False):
 
 
 def get_mediolaid_by_address(addr):
-    if not isinstance(config['mediola'], list):
-        return 'mediola'
+    """Return the id of the configured Mediola whose host resolves to the
+    packet's source IP, or None if no gateway matches.
+
+    The UDP listener is unauthenticated, so packets from unknown sources
+    must be dropped by the caller — in *all* modes, including the
+    single-gateway one.
+    """
     src_ip = addr[0]
-    # First pass uses the cache. If no cached IP matches, refresh once and
-    # try again so a renewed DHCP lease doesn't strand us forever.
-    for entry in config['mediola']:
-        host = entry.get('host')
-        if not host:
-            continue
-        ipaddr = _resolve_host_ip(host)
-        if ipaddr is not None and src_ip == ipaddr:
-            return entry.get('id', 'mediola')
-    for entry in config['mediola']:
-        host = entry.get('host')
-        if not host:
-            continue
-        ipaddr = _resolve_host_ip(host, force_refresh=True)
-        if ipaddr is not None and src_ip == ipaddr:
-            return entry.get('id', 'mediola')
-    return 'mediola'
+    if isinstance(config['mediola'], list):
+        entries = [(e.get('host'), e.get('id', 'mediola'))
+                   for e in config['mediola']]
+    else:
+        entries = [(config['mediola'].get('host'), 'mediola')]
+    # First pass uses the cache. If no cached IP matches, refresh (subject
+    # to the per-host cooldown) and try again so a renewed DHCP lease
+    # doesn't strand us forever.
+    for force in (False, True):
+        for host, mediolaid in entries:
+            if not host:
+                continue
+            ipaddr = _resolve_host_ip(host, force_refresh=force)
+            if ipaddr is not None and src_ip == ipaddr:
+                return mediolaid
+    return None
 
 
-def handle_packet_v4(data, addr):
+def _log_dropped_udp_source(src_ip):
+    """Warn once per source about dropped packets, then demote to DEBUG."""
+    if src_ip in _unknown_source_logged:
+        logger.debug("Dropping UDP packet from unknown source %s", src_ip)
+        return
+    if len(_unknown_source_logged) >= 1024:
+        _unknown_source_logged.clear()
+    _unknown_source_logged.add(src_ip)
+    logger.warning(
+        "Dropping UDP packet from unknown source %s (not a configured "
+        "Mediola gateway host); further drops from this source are "
+        "logged at DEBUG", src_ip)
+
+
+def handle_packet_v4(data, mediolaid):
     try:
         data_dict = json.loads(data)
     except (ValueError, TypeError):
@@ -901,7 +1094,6 @@ def handle_packet_v4(data, addr):
     except (KeyError, TypeError, AttributeError):
         return False
 
-    mediolaid = get_mediolaid_by_address(addr)
     topic, payload, retain = handle_button(packet_type, button_addr, state, mediolaid)
     if not topic:
         # ER addresses are 1-byte hex; RT/R2 use the full hex-string prefix.
@@ -922,7 +1114,7 @@ def handle_packet_v4(data, addr):
     return False
 
 
-def handle_packet_v6(data, addr):
+def handle_packet_v6(data, mediolaid):
     try:
         data_dict = json.loads(data)
     except (ValueError, TypeError):
@@ -938,7 +1130,6 @@ def handle_packet_v6(data, addr):
         return False
 
     state = raw_state[-2:] if packet_type == 'ER' else raw_state
-    mediolaid = get_mediolaid_by_address(addr)
     topic, payload, retain = handle_button(packet_type, address, state, mediolaid)
     if not topic:
         try:
@@ -955,17 +1146,26 @@ def handle_packet_v6(data, addr):
 
 # calculate switch address from on_value for IT switches
 def get_IT_address(on_value):
-    # ITT-1500 new self-learning code
-    if len(on_value) == 8:
-        # 26bit address, (2 bit command), 4 bit channel
-        return format(int(on_value, 16) & 0xFFFFFFC7, "08x")
-    # familiy-code, device-code
-    elif len(on_value) == 3:
-        family_code = chr(int(on_value[0], 16) + 65)
-        device_code = format(int(on_value[1], 16) + 1, "02")
-        return family_code + device_code
-    else:
-        return "0"
+    """Derive the switch address from on_value, or None if it is malformed.
+
+    Runs during index building at import time, so a config typo must yield
+    a skipped device, not a crash-looping add-on.
+    """
+    try:
+        # ITT-1500 new self-learning code
+        if len(on_value) == 8:
+            # 26bit address, (2 bit command), 4 bit channel
+            return format(int(on_value, 16) & 0xFFFFFFC7, "08x")
+        # familiy-code, device-code
+        elif len(on_value) == 3:
+            family_code = chr(int(on_value[0], 16) + 65)
+            device_code = format(int(on_value[1], 16) + 1, "02")
+            return family_code + device_code
+    except (ValueError, TypeError):
+        logger.warning("Invalid IT on_value %r; cannot derive address",
+                       on_value)
+        return None
+    return "0"
 
 
 # calculate switch "address" from name for IR switches
@@ -1007,7 +1207,14 @@ def _build_indexes():
         _blind_command_index.setdefault((mid, btype, cadr), cfg)
         # Status packets: ER blinds receive ER packets, RT blinds receive R2.
         if btype == 'ER':
-            _blind_status_index.setdefault((mid, 'ER', cadr.lower()), cfg)
+            # Incoming ER packet addresses are normalized to zero-padded
+            # decimal ('05'); normalize the config value the same way so
+            # adr "5" matches status packets, not just commands.
+            try:
+                status_key = format(int(cadr), '02d')
+            except (ValueError, TypeError):
+                status_key = str(cadr).lower()
+            _blind_status_index.setdefault((mid, 'ER', status_key), cfg)
         elif btype == 'RT':
             _blind_status_index.setdefault((mid, 'R2', cadr.lower()), cfg)
 
@@ -1062,13 +1269,17 @@ def main():
     _build_indexes()
 
     mqttc = mqtt.Client()
+    # Defense in depth: even with callbacks individually guarded, never let
+    # a stray exception kill the paho network thread (the process would
+    # stay alive but deaf to MQTT).
+    mqttc.suppress_exceptions = True
     mqttc.on_connect = on_connect
     mqttc.on_subscribe = on_subscribe
     mqttc.on_disconnect = on_disconnect
     mqttc.on_message = on_message
 
     if config['mqtt'].get('debug'):
-        print("Debugging messages enabled")
+        logger.info("Debugging messages enabled")
         mqttc.on_log = on_log
         mqttc.on_publish = on_publish
 
@@ -1078,9 +1289,16 @@ def main():
     try:
         mqttc.connect(config['mqtt']['host'], config['mqtt']['port'], 60)
     except (OSError, ConnectionError) as err:
-        print(f'Error connecting to MQTT ({err}), will now quit.')
+        logger.error('Error connecting to MQTT (%s), will now quit.', err)
         sys.exit(1)
     mqttc.loop_start()
+
+    # Gateway HTTP requests run on this thread, not the MQTT network thread.
+    _command_worker_started.set()
+    command_thread = threading.Thread(target=_command_worker,
+                                      name='mediola-command-worker',
+                                      daemon=True)
+    command_thread.start()
 
     listen_port = 1902
     if 'general' in config and 'port' in config['general']:
@@ -1105,27 +1323,37 @@ def main():
             except socket.timeout:
                 continue
             except OSError as err:
-                print(f"Socket error: {err}")
+                logger.error("Socket error: %s", err)
                 break
 
+            # The UDP listener is unauthenticated: only accept packets whose
+            # source IP belongs to a configured gateway, in every mode.
+            mediolaid = get_mediolaid_by_address(addr)
+            if mediolaid is None:
+                _log_dropped_udp_source(addr[0])
+                continue
+
+            # Re-publishing the raw datagram is a debugging aid only; doing
+            # it unconditionally would inject gateway traffic verbatim into
+            # the MQTT bus.
             if config['mqtt'].get('debug'):
-                print('Received message: %s' % data)
-            _safe_publish(config['mqtt']['topic'], data, retain=False)
+                logger.debug('Received message: %s', data)
+                _safe_publish(config['mqtt']['topic'], data, retain=False)
 
             # For the v4 (and probably v5) gateways, the status packet starts
             # with '{XC_EVT}', but for the v6 it starts with 'STA:'.
             if data.startswith(b'{XC_EVT}'):
                 data = data.replace(b'{XC_EVT}', b'')
-                if not handle_packet_v4(data, addr):
-                    if config['mqtt'].get('debug'):
-                        print('Error handling v4 packet: %s' % data)
+                if not handle_packet_v4(data, mediolaid):
+                    logger.debug('Error handling v4 packet: %s', data)
             elif data.startswith(b'STA:'):
                 data = data.replace(b'STA:', b'')
-                if not handle_packet_v6(data, addr):
-                    if config['mqtt'].get('debug'):
-                        print('Error handling v6 packet: %s' % data)
+                if not handle_packet_v6(data, mediolaid):
+                    logger.debug('Error handling v6 packet: %s', data)
     finally:
-        print('Shutting down.')
+        logger.info('Shutting down.')
+        _command_worker_started.clear()
+        _command_queue.put(None)
         with blind_state_lock:
             for t in list(blind_timers.values()):
                 t.cancel()
