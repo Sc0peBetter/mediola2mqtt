@@ -39,6 +39,7 @@ class DnsCacheTtlTests(unittest.TestCase):
     def setUp(self):
         with self.m._mediola_host_ip_cache_lock:
             self.m._mediola_host_ip_cache.clear()
+            self.m._dns_force_refresh_last.clear()
 
     def test_cache_is_used_within_ttl(self):
         with mock.patch.object(self.m.socket, 'gethostbyname',
@@ -79,6 +80,53 @@ class DnsCacheTtlTests(unittest.TestCase):
                                                      force_refresh=True))
         # Cache entry should have been dropped on failure.
         self.assertNotIn('host.example', self.m._mediola_host_ip_cache)
+
+    def test_force_refresh_is_rate_limited(self):
+        with mock.patch.object(self.m.socket, 'gethostbyname',
+                               side_effect=['1.2.3.4', '5.6.7.8']) as resolver:
+            self.assertEqual(
+                self.m._resolve_host_ip('host.example', force_refresh=True),
+                '1.2.3.4')
+            # Within the cooldown the cached value is served, no DNS hit.
+            self.assertEqual(
+                self.m._resolve_host_ip('host.example', force_refresh=True),
+                '1.2.3.4')
+            self.assertEqual(resolver.call_count, 1)
+            # After the cooldown a forced refresh resolves again.
+            with self.m._mediola_host_ip_cache_lock:
+                self.m._dns_force_refresh_last['host.example'] -= (
+                    self.m.DNS_FORCE_REFRESH_COOLDOWN + 1)
+            self.assertEqual(
+                self.m._resolve_host_ip('host.example', force_refresh=True),
+                '5.6.7.8')
+            self.assertEqual(resolver.call_count, 2)
+
+
+class GetMediolaidByAddressTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.m = load_module()
+
+    def setUp(self):
+        with self.m._mediola_host_ip_cache_lock:
+            self.m._mediola_host_ip_cache.clear()
+            self.m._dns_force_refresh_last.clear()
+
+    def test_known_source_returns_matching_id(self):
+        # Hosts in the test config are IP literals; gethostbyname echoes them.
+        with mock.patch.object(self.m.socket, 'gethostbyname',
+                               side_effect=lambda h: h):
+            self.assertEqual(
+                self.m.get_mediolaid_by_address(('192.0.2.20', 1902)),
+                'mediola2')
+
+    def test_unknown_source_returns_none(self):
+        # Spoofed/unknown senders must NOT fall back to a default id —
+        # the UDP listener is unauthenticated.
+        with mock.patch.object(self.m.socket, 'gethostbyname',
+                               side_effect=lambda h: h):
+            self.assertIsNone(
+                self.m.get_mediolaid_by_address(('203.0.113.99', 1902)))
 
 
 if __name__ == '__main__':

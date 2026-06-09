@@ -65,8 +65,17 @@ that listens for the status changes, interprets them and publishes them via MQTT
 This is useful for buttons/switches, but can also be used for the state
 of a blind (only implemented for Elero).
 
+UDP status packets are unauthenticated, so the bridge only accepts packets
+whose source IP matches a configured Mediola `host`; packets from any other
+address are dropped and logged. Raw datagrams are re-published to the MQTT
+base topic only when `debug: true` is set.
+
 Controlling a blind or other device is done via HTTP, by interpreting MQTT messages
 and triggering the HTTP API.
+
+Estimated blind positions (for blinds with `travel_time`) are published
+retained and read back on startup, so position state survives restarts of
+the add-on.
 
 ## Templating
 
